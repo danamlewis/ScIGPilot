@@ -1,0 +1,512 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SCIG Schedule Simulator</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" defer></script>
+    <script src="script.js" defer></script>
+  </head>
+  <body>
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Comparative SCIG schedule model</p>
+        <h1>SCIG Schedule Simulator</h1>
+        <p class="subtitle">
+          Compare relative exposure shape, model-derived IgG amplitude, dose intensity, infusion-site burden, and estimated infusion time across subcutaneous immunoglobulin schedules.
+        </p>
+      </div>
+      <aside class="notice">
+        This is a comparative simulator. It estimates model-derived IgG ranges from editable assumptions, not an individual patient's true serum IgG level, and it does not recommend dose changes.
+      </aside>
+    </header>
+
+    <main>
+      <section class="setup-snapshot" aria-label="Current simulator setup">
+        <div class="snapshot-heading">
+          <span>Current setup</span>
+          <strong id="snapshotPrimary">Loading defaults</strong>
+        </div>
+        <div id="setupSnapshot" class="snapshot-grid"></div>
+      </section>
+
+      <section id="compareBar" class="compare-bar" aria-label="Active comparison"></section>
+
+      <section class="panel setup-panel">
+        <div class="panel-heading">
+          <div>
+            <h2>Dose Setup <span class="help-tip" title="Product-rounded dose is the feasible administered amount after matching the requested dose to available cartridge sizes.">?</span></h2>
+            <p>Enter either a weight-based weekly protocol dose or the total product amount for the reference q7 dose. Presets are generated from this amount.</p>
+          </div>
+        </div>
+        <details class="editable-section">
+          <summary>
+            <span>Edit dose and weight</span>
+            <small>Default: 65 kg, replacement-style 0.1 g/kg/week</small>
+          </summary>
+          <div class="form-grid">
+            <label>
+              Dose entry mode
+              <select id="doseEntryMode">
+                <option value="protocol" selected>Protocol dose + weight</option>
+                <option value="total">Total weekly product dose</option>
+              </select>
+            </label>
+            <label>
+              Body weight (kg)
+              <input id="bodyWeightKg" type="number" min="1" step="1" value="65">
+            </label>
+            <label>
+              Protocol dose (g/kg/week)
+              <input id="protocolDoseGKgWeek" type="number" min="0" step="0.01" value="0.1">
+            </label>
+            <label>
+              Total dose unit
+              <select id="totalDoseUnit">
+                <option value="mL" selected>mL per reference dose</option>
+                <option value="g">g per reference dose</option>
+              </select>
+            </label>
+            <label>
+              Total product dose (mL)
+              <input id="totalDoseMl" type="number" min="0" step="1" value="35">
+            </label>
+            <label>
+              Total product dose (g)
+              <input id="totalDoseG" type="number" min="0" step="0.1" value="7">
+            </label>
+          </div>
+        </details>
+        <div id="doseSetupSummary" class="interpretation scenario-summary"></div>
+      </section>
+
+      <section class="panel setup-panel">
+        <div class="panel-heading">
+          <div>
+            <h2>IgG Scenario</h2>
+            <p>Choose a public-facing starting assumption. These values scale the estimated IgG bands; they are not treatment targets.</p>
+          </div>
+        </div>
+        <details class="editable-section">
+          <summary>
+            <span>Edit IgG scenario assumptions</span>
+            <small>Default: replacement / PI-style starting model</small>
+          </summary>
+          <div class="form-grid">
+            <label>
+              Scenario
+              <select id="iggScenarioMode">
+                <option value="replacement" selected>Replacement / PI-style default</option>
+                <option value="neurologic">High-dose neurologic default</option>
+                <option value="custom">Custom model patient</option>
+              </select>
+            </label>
+            <label>
+              Baseline pre-SCIG IgG (mg/dL)
+              <input id="baselinePreScigIgg" type="number" min="0" step="1" value="1000">
+            </label>
+            <label>
+              Dose slope (mg/dL per 0.1 g/kg/week)
+              <input id="doseSlope" type="number" min="0" step="1" value="125">
+            </label>
+            <label>
+              Peak-to-trough ratio
+              <input id="peakToTroughRatio" type="number" min="1" step="0.01" value="1.10">
+            </label>
+            <label>
+              Peak timing after weekly infusion (days)
+              <input id="modelTmaxDays" type="number" min="0" step="0.25" value="3">
+            </label>
+            <label>
+              Lab reference low (mg/dL)
+              <input id="labReferenceLow" type="number" min="0" step="1" value="586">
+            </label>
+            <label>
+              Lab reference high (mg/dL)
+              <input id="labReferenceHigh" type="number" min="0" step="1" value="1602">
+            </label>
+            <label>
+              High-value warning threshold (mg/dL)
+              <input id="highIggWarningThreshold" type="number" min="0" step="1" value="2600">
+            </label>
+            <label>
+              Baseline uncertainty (+/- mg/dL)
+              <input id="baselineUncertainty" type="number" min="0" step="1" value="100">
+            </label>
+            <label>
+              Slope uncertainty (+/- %)
+              <input id="slopeUncertaintyPercent" type="number" min="0" step="1" value="20">
+            </label>
+            <label>
+              Custom day-3 IgG override (mg/dL)
+              <input id="customCalibrationIgg" type="number" min="0" step="1" value="">
+            </label>
+          </div>
+        </details>
+        <div id="iggScenarioSummary" class="interpretation scenario-summary"></div>
+      </section>
+
+      <section class="grid two">
+        <article class="panel">
+          <div class="panel-heading">
+            <div>
+              <h2>Product Settings <span class="help-tip" title="Changing conventional SCIG products changes concentration and available presentation sizes; it does not otherwise change the simulator equations.">?</span></h2>
+              <p>Pick a product presentation set or edit the available package sizes. This changes feasible mL and cartridge counts, not the exposure equations.</p>
+            </div>
+          </div>
+          <details class="editable-section">
+            <summary>
+              <span>Edit product and cartridge selection</span>
+              <small>Default: Hizentra 20%, high-flow 26G setup, auto-filled cartridges</small>
+            </summary>
+            <div class="form-grid">
+              <label>
+                Product
+                <select id="productPreset">
+                  <option value="hizentra" selected>Hizentra 20%</option>
+                  <option value="cuvitru">Cuvitru 20%</option>
+                  <option value="xembify">Xembify 20%</option>
+                  <option value="custom">Custom product</option>
+                </select>
+              </label>
+              <label>
+                Product name
+                <input id="productName" type="text" value="Hizentra 20%">
+              </label>
+              <label>
+                Concentration (g/mL)
+                <input id="concentration" type="number" min="0.01" step="0.01" value="0.2">
+              </label>
+              <label>
+                Needle type
+                <select id="needleType">
+                  <option value="highFlo26G">26G needle set</option>
+                </select>
+              </label>
+              <label>
+                Tubing
+                <select id="tubing">
+                  <option value="F2400">F2400</option>
+                  <option value="F1200">F1200</option>
+                  <option value="F900">F900</option>
+                  <option value="F600">F600</option>
+                  <option value="F500">F500</option>
+                  <option value="F420">F420</option>
+                  <option value="F275">F275</option>
+                  <option value="F180">F180</option>
+                  <option value="F120">F120</option>
+                </select>
+              </label>
+              <label>
+                Reference time: 50 mL, 4 sites (min)
+                <input id="referenceRunMinutes" type="number" min="1" step="1" value="46">
+              </label>
+            </div>
+            <div class="cartridge-panel">
+              <div class="cartridge-panel-heading">
+                <h3>Cartridge selection</h3>
+                <button class="secondary" id="autoCartridges" type="button">Auto-fill</button>
+              </div>
+              <div id="cartridgePicker" class="cartridge-picker"></div>
+              <div id="cartridgeValidation" class="field-message"></div>
+            </div>
+          </details>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <div>
+              <h2>Simulation Assumptions</h2>
+              <p>The current simulation starts from zero exposure at day 0, then normalizes to the reference regimen's final 28-day average.</p>
+            </div>
+          </div>
+          <details class="editable-section">
+            <summary>
+              <span>Edit simulation assumptions</span>
+              <small>Default: absorption 1.4 days, elimination 30 days, 180-day horizon</small>
+            </summary>
+            <div class="form-grid">
+              <label>
+                Absorption half-time (days)
+                <input id="absorptionHalfTime" type="number" min="0.1" step="0.1" value="1.4">
+              </label>
+              <label>
+                Elimination half-life (days)
+                <input id="eliminationHalfLife" type="number" min="1" step="1" value="30">
+              </label>
+              <label>
+                Horizon (days)
+                <select id="simulationHorizon">
+                  <option value="90">90</option>
+                  <option value="180" selected>180</option>
+                  <option value="365">365</option>
+                </select>
+              </label>
+              <label>
+                Timestep (days)
+                <select id="timestep">
+                  <option value="0.5">0.5</option>
+                  <option value="0.25" selected>0.25</option>
+                </select>
+              </label>
+            </div>
+          </details>
+        </article>
+      </section>
+
+      <section class="regimen-layout">
+        <article class="panel regimen-panel">
+          <div class="panel-heading">
+            <div>
+              <h2>Reference Regimen</h2>
+              <p>Default is generated from Dose Setup; replacement starts at 32.5 mL every 7 days for 65 kg at 0.1 g/kg/week.</p>
+            </div>
+            <select id="referencePreset" class="preset-select" aria-label="Reference preset"></select>
+          </div>
+          <div id="referenceCard"></div>
+          <div id="referenceEditor"></div>
+        </article>
+
+        <article class="panel regimen-panel">
+          <div class="panel-heading">
+            <div>
+              <h2>Comparator Regimens</h2>
+              <p>Rename, edit, and reorder comparators. Chart and table order follow this list.</p>
+            </div>
+            <button id="addComparator" class="secondary" type="button">Add Comparator</button>
+          </div>
+          <div class="toolbar">
+            <label>
+              Load preset into selected comparator
+              <select id="candidatePreset" class="preset-select" aria-label="Candidate preset"></select>
+            </label>
+          </div>
+          <div id="comparatorManager" class="comparator-manager"></div>
+          <div id="candidateCard"></div>
+          <div id="candidateEditor"></div>
+        </article>
+      </section>
+
+      <section class="panel results-surface">
+        <div class="panel-heading">
+          <div>
+            <h2>Results Summary <span class="help-tip" title="Dose intensity, timing, and burden are model comparisons, not dose-change recommendations.">?</span></h2>
+            <p>Reference average exposure over the final 28 days of the full simulation is defined as 100%.</p>
+          </div>
+        </div>
+        <div id="resultsDashboard" class="dashboard-grid"></div>
+        <div id="deltaNarratives" class="narrative-grid"></div>
+        <div id="interpretation" class="interpretation"></div>
+        <details class="disclosure-section detail-section">
+          <summary>
+            <span>View model assumptions used</span>
+            <small>Scenario, dose slope, PK assumptions, product concentration, and cartridges</small>
+          </summary>
+          <div id="assumptionAudit" class="audit-grid"></div>
+        </details>
+        <details class="disclosure-section detail-section">
+          <summary>
+            <span>View detailed metrics table</span>
+            <small>Dose intensity, burden, timing, exposure, and cartridge feasibility</small>
+          </summary>
+          <div id="resultsTable" class="results-table"></div>
+        </details>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div>
+            <h2>Estimated IgG Amplitude <span class="help-tip" title="Modeled serum IgG estimates are scaled from the selected scenario assumptions and are not measured patient labs.">?</span></h2>
+            <p>Uses the selected IgG scenario to estimate plausible peak-trough swing bands for this model patient.</p>
+          </div>
+        </div>
+        <div class="chart-tabs" role="tablist" aria-label="Chart mode">
+          <button class="active" type="button" data-chart-mode="igg">Estimated IgG</button>
+          <button type="button" data-chart-mode="relative">Relative exposure</button>
+          <button type="button" data-chart-mode="switch">Switch view</button>
+          <button type="button" data-chart-mode="dose">Dose events</button>
+          <button type="button" data-chart-mode="burden">Model analysis</button>
+        </div>
+        <div class="uncertainty-legend" id="uncertaintyLegend">
+          <span><b class="legend-line"></b>center line = modeled midpoint</span>
+          <span><b class="legend-band"></b>shaded band = editable uncertainty range</span>
+          <span><b class="legend-dotted"></b>dotted lines = lab reference range for orientation</span>
+          <span><b class="legend-dose"></b>vertical markers = dose events</span>
+        </div>
+        <details class="editable-section compact-editor">
+          <summary>
+            <span>Edit uncertainty assumptions</span>
+            <small>Default: absorption 1-3 days, elimination 21-35 days</small>
+          </summary>
+          <div class="form-grid amplitude-controls">
+            <label>
+              Absorption half-time low (days)
+              <input id="absorptionHalfTimeLow" type="number" min="0.1" step="0.1" value="1">
+            </label>
+            <label>
+              Absorption half-time high (days)
+              <input id="absorptionHalfTimeHigh" type="number" min="0.1" step="0.1" value="3">
+            </label>
+            <label>
+              Elimination half-life low (days)
+              <input id="eliminationHalfLifeLow" type="number" min="1" step="1" value="21">
+            </label>
+            <label>
+              Elimination half-life high (days)
+              <input id="eliminationHalfLifeHigh" type="number" min="1" step="1" value="35">
+            </label>
+          </div>
+        </details>
+        <div class="grid chart-grid amplitude-chart-grid chart-mode-panel" data-chart-panel="igg">
+          <article class="analysis-block amplitude-chart-block">
+            <h3>Estimated IgG bands by schedule</h3>
+            <p>Final 42 days of each schedule, scaled from the selected scenario and uncertainty settings.</p>
+            <div class="chart-wrap amplitude-chart-wrap">
+              <canvas id="amplitudeBandChart"></canvas>
+            </div>
+          </article>
+          <article class="analysis-block amplitude-chart-block">
+            <h3>Estimated IgG band after switch</h3>
+            <p>Reference schedule before day 0, then switch to the selected comparator.</p>
+            <div class="chart-wrap amplitude-chart-wrap">
+              <canvas id="amplitudeSwitchChart"></canvas>
+            </div>
+          </article>
+        </div>
+        <details class="disclosure-section detail-section">
+          <summary>
+            <span>View estimated IgG tables</span>
+            <small>Steady swing estimates, scenario anchor, and delayed-dose waning</small>
+          </summary>
+          <div id="amplitudeSummary" class="analysis-summary amplitude-summary"></div>
+        </details>
+      </section>
+
+      <section class="grid chart-grid">
+        <article class="panel chart-panel chart-mode-panel hidden" data-chart-panel="relative">
+          <div class="panel-heading">
+            <div>
+            <h2>Relative Exposure <span class="help-tip" title="Relative exposure is normalized to the reference regimen average; it is not a measured serum IgG value.">?</span></h2>
+              <p>Full-horizon views include ramp-up from a zero-start assumption; values are relative, not serum concentrations.</p>
+            </div>
+            <label class="compact">
+              Chart window
+              <select id="chartWindow">
+                <option value="all" selected>Full horizon</option>
+                <option value="60">Last 60 days</option>
+                <option value="90">Last 90 days</option>
+                <option value="180">Last 180 days</option>
+              </select>
+            </label>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="exposureChart"></canvas>
+          </div>
+        </article>
+
+        <article class="panel chart-mode-panel hidden" data-chart-panel="dose">
+          <div class="panel-heading">
+            <div>
+              <h2>Dose Timeline</h2>
+              <p>First 32 days, repeated from each regimen cycle.</p>
+            </div>
+          </div>
+          <div id="timeline" class="timeline"></div>
+        </article>
+      </section>
+
+      <section class="panel chart-panel chart-mode-panel hidden" data-chart-panel="switch">
+        <div class="panel-heading">
+          <div>
+            <h2>Switch Scenario</h2>
+            <p>Assume the reference regimen has already been running, then switch to the selected comparator at day 0.</p>
+          </div>
+          <details class="editable-section compact-editor">
+            <summary>
+              <span>Edit switch setup</span>
+              <small>Default: 140-day reference run-in, 180-day follow-up</small>
+            </summary>
+            <div class="form-grid switch-controls">
+              <label>
+                Switch to comparator
+                <select id="switchComparator"></select>
+              </label>
+              <label>
+                Reference preconditioning (days)
+                <input id="switchPreconditionDays" type="number" min="0" step="7" value="140">
+              </label>
+              <label>
+                Follow-up after switch (days)
+                <input id="switchHorizonDays" type="number" min="14" step="14" value="180">
+              </label>
+            </div>
+          </details>
+        </div>
+        <div id="switchSummary" class="switch-summary"></div>
+        <div class="chart-wrap">
+          <canvas id="switchChart"></canvas>
+        </div>
+      </section>
+
+      <section class="panel chart-mode-panel hidden" data-chart-panel="burden">
+        <div class="panel-heading">
+          <div>
+            <h2>Model-Derived Analysis</h2>
+            <p>Threshold-based summaries from the current simulation settings. These describe the model behavior, not measured patient values.</p>
+          </div>
+        </div>
+        <details class="disclosure-section detail-section">
+          <summary>
+            <span>View model-derived analysis tables</span>
+            <small>Ramp-up and switch-settling thresholds</small>
+          </summary>
+          <div id="analysisSummary" class="analysis-summary"></div>
+        </details>
+      </section>
+
+      <section class="panel notes">
+        <div class="panel-heading">
+          <div>
+            <h2>Interpretation Notes</h2>
+            <p>How to read the simulator outputs and current assumptions.</p>
+          </div>
+        </div>
+        <div class="notes-grid">
+          <article>
+            <h3>Scenario presets</h3>
+            <p>IgG presets are editable starting assumptions. They scale the estimated IgG bands but are not treatment targets.</p>
+          </article>
+          <article>
+            <h3>Reference range</h3>
+            <p>Lab reference lines are shown for orientation against a typical non-SCIG range; they are not interpreted as good or bad for someone receiving SCIG.</p>
+          </article>
+          <article>
+            <h3>Product rounding</h3>
+            <p>The requested protocol dose is converted to product volume and rounded to a feasible cartridge combination. The dose basis remains the entered protocol value.</p>
+          </article>
+          <article>
+            <h3>Cartridges</h3>
+            <p>Conventional SCIG product selection changes concentration and presentation sizes. Cartridge counts must match the generated dose before downstream outputs are shown.</p>
+          </article>
+          <article>
+            <h3>Exposure model</h3>
+            <p>Relative exposure is normalized to the reference regimen average. It is a model comparison, not a measured serum concentration.</p>
+          </article>
+          <article>
+            <h3>Burden metrics</h3>
+            <p>Sites, mL/site, cartridge counts, and infusion time are feasibility and burden variables. They do not alter systemic exposure in this version.</p>
+          </article>
+          <article>
+            <h3>Uncertainty bands</h3>
+            <p>Shaded IgG bands reflect the editable baseline, slope, absorption, and elimination assumptions. They are not individual prediction intervals.</p>
+          </article>
+          <article>
+            <h3>Scope</h3>
+            <p>This simulator does not provide clinical recommendations, dose-adjustment advice, patient-specific fitting, risk prediction, accounts, or backend storage.</p>
+          </article>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
