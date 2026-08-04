@@ -51,7 +51,7 @@ jobs:
           cp index.html styles.css script.js qrcode.js _site/
           cp -R vendor _site/
       - name: Upload static site
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@v5
         with:
           path: _site
       - name: Deploy to GitHub Pages
