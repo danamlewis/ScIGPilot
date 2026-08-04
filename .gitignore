@@ -1,0 +1,19 @@
+node_modules/
+.DS_Store
+npm-debug.log*
+tmp/
+output/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Test output
+coverage/
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*~

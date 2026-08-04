@@ -1,5 +1,9 @@
 "use strict";
 
+const APP_VERSION = "0.1.0";
+const REPOSITORY_URL = "https://github.com/danamlewis/ScIGPilot";
+const REPOSITORY_LABEL = "github.com/danamlewis/ScIGPilot";
+
 function cleanDoseNumber(value, digits = 1) {
   const rounded = Number(Number(value).toFixed(digits));
   return Number.isInteger(rounded) ? String(rounded) : String(rounded);
@@ -13,7 +17,14 @@ function roundedVolume(value) {
   return Number(Number(value).toFixed(1));
 }
 
+function wholeCycleDays(value, fallback = 7) {
+  const numericValue = Number(value);
+  if (!Number.isFinite(numericValue) || numericValue <= 0) return Math.max(1, Math.round(Number(fallback) || 7));
+  return Math.max(1, Math.round(numericValue));
+}
+
 const defaultProductPresetId = "hizentra";
+const amplitudeSeriesColors = ["#4d2d96", "#0f8b8d", "#b95f89", "#3266a8", "#7a6f21"];
 
 const productPresets = {
   hizentra: {
@@ -246,7 +257,6 @@ const iggScenarioPresets = {
     tmaxDaysAfterWeeklyInfusion: 3,
     peakToTroughRatio: 1.10,
     highIggWarningThresholdMgDl: 2600,
-    customCalibrationIggMgDl: 2613,
   },
   neurologic: {
     label: "High-dose neurologic default",
@@ -257,18 +267,16 @@ const iggScenarioPresets = {
     tmaxDaysAfterWeeklyInfusion: 3,
     peakToTroughRatio: 1.12,
     highIggWarningThresholdMgDl: 2800,
-    customCalibrationIggMgDl: 2613,
   },
   custom: {
-    label: "Custom upper-tail model patient",
-    protocolDoseGKgWeek: 0.4,
-    baselinePreScigIggMgDl: 1400,
-    steadyStateTroughIggMgDl: 2350,
-    weeklyPeakIggMgDl: 2613,
+    label: "Custom model patient",
+    protocolDoseGKgWeek: 0.1,
+    baselinePreScigIggMgDl: 1000,
+    steadyStateTroughIggMgDl: 1500,
+    weeklyPeakIggMgDl: 1650,
     tmaxDaysAfterWeeklyInfusion: 3,
-    peakToTroughRatio: 1.11,
-    highIggWarningThresholdMgDl: 2800,
-    customCalibrationIggMgDl: 2613,
+    peakToTroughRatio: 1.10,
+    highIggWarningThresholdMgDl: 2600,
   },
 };
 
@@ -315,7 +323,7 @@ const state = {
     mode: "replacement",
     bodyWeightKg: 65,
     baselinePreScigIggMgDl: 1000,
-    doseSlopeMgDlPer01GKgWeek: 125,
+    doseSlopeMgDlPer01GKgWeek: 500,
     peakToTroughRatio: 1.10,
     tmaxDaysAfterWeeklyInfusion: 3,
     labReferenceLowMgDl: 586,
@@ -323,7 +331,6 @@ const state = {
     highIggWarningThresholdMgDl: 2600,
     baselineUncertaintyMgDl: 100,
     slopeUncertaintyPercent: 20,
-    customCalibrationIggMgDl: 2613,
     absorptionHalfTimeLowDays: 1,
     absorptionHalfTimeHighDays: 3,
     eliminationHalfLifeLowDays: 21,
@@ -332,16 +339,37 @@ const state = {
   reference: structuredClone(presets[0]),
   comparators: [
     createComparatorFromPreset(presets[1], "comp-1"),
-    createComparatorFromPreset(presets[3], "comp-2"),
+    createComparatorFromPreset(presets[2], "comp-2"),
   ],
   activeComparatorId: "comp-1",
   switchComparatorId: "comp-1",
   chartWindow: "all",
   chartMode: "igg",
+  interval: {
+    regimenId: "reference",
+    horizonDays: 180,
+    checkpointDay: 7,
+    upperThresholdMgDl: 1602,
+    lowerThresholdMgDl: 586,
+  },
 };
 
 let exposureChart;
 let switchChart;
+let intervalExplorerActive = false;
+let pendingReferencePresetId = "";
+let pendingComparatorPresetId = "";
+let shareQrTimer = null;
+let simulationInputTimer = null;
+let editingComparatorId = null;
+let amplitudeSummaryCache = new WeakMap();
+let calibrationScenarioCache = null;
+let scenarioScaleCache = new Map();
+let exposurePrintConfig = null;
+let switchPrintConfig = null;
+let originalDocumentTitle = null;
+const bandCanvasPrintConfigs = new Map();
+const editedRegimens = new WeakSet();
 
 const $ = (id) => document.getElementById(id);
 const round = (value, digits = 1) => Number.isFinite(value) ? Number(value).toFixed(digits) : "n/a";
@@ -356,6 +384,305 @@ const formatDose = (value) => `${formatNumber(value, 1)} g`;
 const formatDays = (value) => `${formatNumber(value, Number.isInteger(value) ? 0 : 1)} days`;
 const formatMgDl = (value) => `${formatNumber(value, 0)} mg/dL`;
 const formatInteger = (value) => formatNumber(value, 0);
+const SHARE_PAYLOAD_VERSION = 1;
+const MAX_SHARE_TOKEN_LENGTH = 24000;
+const MAX_SHARED_COMPARATORS = 4;
+const MAX_SHARED_EVENTS_PER_REGIMEN = 6;
+const MAX_SHARED_EVENT_OCCURRENCES_PER_YEAR = 800;
+
+function boundedNumber(value, fallback, min, max, integer = false) {
+  const numericValue = Number(value);
+  if (!Number.isFinite(numericValue)) return fallback;
+  const bounded = Math.min(max, Math.max(min, numericValue));
+  return integer ? Math.round(bounded) : bounded;
+}
+
+function allowedValue(value, allowed, fallback) {
+  return allowed.includes(value) ? value : fallback;
+}
+
+function safeLabel(value, fallback, maxLength = 80) {
+  if (typeof value !== "string") return fallback;
+  const normalized = value.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
+  return normalized ? normalized.slice(0, maxLength) : fallback;
+}
+
+function utf8ToBase64Url(value) {
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(value, "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  bytes.forEach((byte) => {
+    binary += String.fromCharCode(byte);
+  });
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function base64UrlToUtf8(value) {
+  const base64 = String(value).replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(String(value).length / 4) * 4, "=");
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(base64, "base64").toString("utf8");
+  }
+  const binary = atob(base64);
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+function compactInventory(inventory) {
+  return inventory.map((entry) => [roundedVolume(Number(entry.volumeMl)), Math.max(0, Math.round(Number(entry.count)))]);
+}
+
+function expandInventory(entries) {
+  if (!Array.isArray(entries)) return [];
+  return entries.slice(0, 12)
+    .map((entry) => ({
+      volumeMl: boundedNumber(entry?.[0], 0, 0, 1000),
+      count: boundedNumber(entry?.[1], 0, 0, 100, true),
+    }))
+    .filter((entry) => Number.isFinite(entry.volumeMl) && entry.volumeMl > 0)
+    .sort((a, b) => b.volumeMl - a.volumeMl);
+}
+
+function compactEvents(events) {
+  return events.map((event) => [Number(event.day), Number(event.volumeMl), Number(event.sites)]);
+}
+
+function expandEvents(events, cycleLengthDays = 7) {
+  if (!Array.isArray(events)) return [];
+  const latestEventDay = Math.max(0, Number(cycleLengthDays) - 0.25);
+  const frequencyBound = Math.max(1, Math.floor(MAX_SHARED_EVENT_OCCURRENCES_PER_YEAR * Number(cycleLengthDays) / 365));
+  const eventLimit = Math.min(MAX_SHARED_EVENTS_PER_REGIMEN, frequencyBound);
+  return events.slice(0, eventLimit)
+    .filter((event) => Array.isArray(event))
+    .map((event) => ({
+      day: boundedNumber(event[0], 0, 0, latestEventDay),
+      volumeMl: boundedNumber(event[1], 0, 0, 5000),
+      sites: boundedNumber(event[2], 1, 1, 8, true),
+    }));
+}
+
+function compactRegimen(regimen) {
+  return {
+    i: regimen.id,
+    p: regimen.presetId || "custom",
+    n: regimen.name,
+    c: wholeCycleDays(regimen.cycleLengthDays),
+    e: compactEvents(regimen.events),
+  };
+}
+
+function expandRegimen(regimen, fallbackId) {
+  const cycleLengthDays = boundedNumber(regimen?.c, 7, 1, 365, true);
+  const events = expandEvents(regimen?.e, cycleLengthDays);
+  return {
+    id: fallbackId,
+    presetId: safeLabel(regimen?.p, "custom", 40),
+    name: safeLabel(regimen?.n, "Untitled regimen"),
+    cycleLengthDays,
+    events: events.length ? events : [{ day: 0, volumeMl: 5, sites: 1 }],
+  };
+}
+
+function serializeSimulatorState() {
+  return {
+    v: SHARE_PAYLOAD_VERSION,
+    p: {
+      i: state.product.presetId,
+      n: state.product.name,
+      c: Number(state.product.concentrationGPerMl),
+      nt: state.product.needleType,
+      t: state.product.tubing,
+      cm: state.product.cartridgeSelectionMode,
+      ci: compactInventory(state.product.cartridgeInventory),
+      rr: Number(state.product.referenceRunMinutes),
+    },
+    d: {
+      e: state.dosing.entryMode,
+      pd: Number(state.dosing.protocolDoseGKgWeek),
+      tu: state.dosing.totalDoseUnit,
+      tm: Number(state.dosing.totalDoseMl),
+      tg: Number(state.dosing.totalDoseG),
+    },
+    m: {
+      a: Number(state.params.absorptionHalfTimeDays),
+      e: Number(state.params.eliminationHalfLifeDays),
+      h: Number(state.params.simulationHorizonDays),
+      ts: Number(state.params.timestepDays),
+      sp: Number(state.params.switchPreconditionDays),
+      sh: Number(state.params.switchHorizonDays),
+    },
+    g: {
+      m: state.calibration.mode,
+      w: Number(state.calibration.bodyWeightKg),
+      b: Number(state.calibration.baselinePreScigIggMgDl),
+      s: Number(state.calibration.doseSlopeMgDlPer01GKgWeek),
+      pr: Number(state.calibration.peakToTroughRatio),
+      tx: Number(state.calibration.tmaxDaysAfterWeeklyInfusion),
+      ll: Number(state.calibration.labReferenceLowMgDl),
+      lh: Number(state.calibration.labReferenceHighMgDl),
+      hw: Number(state.calibration.highIggWarningThresholdMgDl),
+      bu: Number(state.calibration.baselineUncertaintyMgDl),
+      su: Number(state.calibration.slopeUncertaintyPercent),
+      al: Number(state.calibration.absorptionHalfTimeLowDays),
+      ah: Number(state.calibration.absorptionHalfTimeHighDays),
+      el: Number(state.calibration.eliminationHalfLifeLowDays),
+      eh: Number(state.calibration.eliminationHalfLifeHighDays),
+    },
+    r: compactRegimen(state.reference),
+    cs: state.comparators.map(compactRegimen),
+    a: state.activeComparatorId,
+    sw: state.switchComparatorId,
+    cw: state.chartWindow,
+    cm: state.chartMode,
+    x: {
+      r: state.interval.regimenId,
+      h: Number(state.interval.horizonDays),
+      d: Number(state.interval.checkpointDay),
+      u: Number(state.interval.upperThresholdMgDl),
+      l: Number(state.interval.lowerThresholdMgDl),
+    },
+  };
+}
+
+function encodeSharePayload(payload) {
+  return utf8ToBase64Url(JSON.stringify(payload));
+}
+
+function decodeSharePayload(value) {
+  if (typeof value !== "string" || value.length > MAX_SHARE_TOKEN_LENGTH) {
+    throw new Error("Simulator share link is too large.");
+  }
+  const decoded = base64UrlToUtf8(value);
+  if (decoded.length > MAX_SHARE_TOKEN_LENGTH) throw new Error("Simulator share state is too large.");
+  const payload = JSON.parse(decoded);
+  if (!payload || payload.v !== SHARE_PAYLOAD_VERSION) {
+    throw new Error("Unsupported simulator share link version.");
+  }
+  return payload;
+}
+
+function buildShareUrl() {
+  const url = new URL(window.location.href);
+  const hashParams = new URLSearchParams();
+  hashParams.set("s", encodeSharePayload(serializeSimulatorState()));
+  const section = currentSectionFromUrl();
+  if (section) hashParams.set("section", section);
+  url.hash = hashParams.toString();
+  url.search = "";
+  return url.toString();
+}
+
+function readShareTokenFromUrl() {
+  const hash = window.location.hash.startsWith("#") ? window.location.hash.slice(1) : window.location.hash;
+  const hashParams = new URLSearchParams(hash);
+  const queryParams = new URLSearchParams(window.location.search);
+  return hashParams.get("s") || queryParams.get("s");
+}
+
+function currentSectionFromUrl() {
+  const hash = window.location.hash.startsWith("#") ? window.location.hash.slice(1) : window.location.hash;
+  if (!hash) return "";
+  const hashParams = new URLSearchParams(hash);
+  const encodedSection = hashParams.get("section");
+  if (encodedSection) return safeLabel(encodedSection, "", 80);
+  return hash.includes("=") ? "" : safeLabel(hash, "", 80);
+}
+
+function navigateToSection(sectionId) {
+  const target = document.getElementById(sectionId);
+  if (!target) return false;
+  target.scrollIntoView?.({ behavior: "smooth", block: "start" });
+
+  const url = new URL(window.location.href);
+  if (readShareTokenFromUrl()) {
+    const hashParams = new URLSearchParams();
+    hashParams.set("s", encodeSharePayload(serializeSimulatorState()));
+    hashParams.set("section", sectionId);
+    url.searchParams.delete("s");
+    url.hash = hashParams.toString();
+  } else {
+    url.hash = sectionId;
+  }
+  window.history.replaceState(null, "", url.toString());
+  return true;
+}
+
+function applySimulatorState(payload) {
+  if (!payload || payload.v !== SHARE_PAYLOAD_VERSION) return false;
+  const product = payload.p || {};
+  const dosing = payload.d || {};
+  const params = payload.m || {};
+  const calibration = payload.g || {};
+
+  state.product.presetId = allowedValue(product.i, [...Object.keys(productPresets), "custom"], defaultProductPresetId);
+  state.product.name = safeLabel(product.n, state.product.name);
+  state.product.concentrationGPerMl = boundedNumber(product.c, state.product.concentrationGPerMl, 0.01, 1);
+  state.product.needleType = allowedValue(product.nt, ["highFlo26G"], state.product.needleType);
+  state.product.tubing = allowedValue(product.t, Object.keys(exampleScigFlowTable26G.tubing), state.product.tubing);
+  state.product.referenceRunMinutes = boundedNumber(product.rr, state.product.referenceRunMinutes, 1, 1440);
+  state.product.cartridgeSelectionMode = product.cm === "manual" ? "manual" : "auto";
+  if (productPresets[state.product.presetId]) {
+    state.product.cartridgeSizesMl = productPresets[state.product.presetId].cartridgeSizesMl;
+  }
+  const inventory = expandInventory(product.ci);
+  if (inventory.length) {
+    state.product.cartridgeInventory = inventory;
+    state.product.cartridgeInventoryText = inventoryTextFromInventory(inventory);
+  }
+
+  state.dosing.entryMode = dosing.e === "total" ? "total" : "protocol";
+  state.dosing.protocolDoseGKgWeek = boundedNumber(dosing.pd, state.dosing.protocolDoseGKgWeek, 0, 5);
+  state.dosing.totalDoseUnit = dosing.tu === "g" ? "g" : "mL";
+  state.dosing.totalDoseMl = boundedNumber(dosing.tm, state.dosing.totalDoseMl, 0, 5000);
+  state.dosing.totalDoseG = boundedNumber(dosing.tg, state.dosing.totalDoseG, 0, 1000);
+
+  state.params.absorptionHalfTimeDays = boundedNumber(params.a, state.params.absorptionHalfTimeDays, 0.1, 30);
+  state.params.eliminationHalfLifeDays = boundedNumber(params.e, state.params.eliminationHalfLifeDays, 1, 365);
+  state.params.simulationHorizonDays = allowedValue(Number(params.h), [90, 180, 365], state.params.simulationHorizonDays);
+  state.params.timestepDays = allowedValue(Number(params.ts), [0.25, 0.5], state.params.timestepDays);
+  state.params.switchPreconditionDays = boundedNumber(params.sp, state.params.switchPreconditionDays, 0, 3650);
+  state.params.switchHorizonDays = boundedNumber(params.sh, state.params.switchHorizonDays, 14, 730);
+
+  state.calibration.mode = allowedValue(calibration.m, Object.keys(iggScenarioPresets), state.calibration.mode);
+  state.calibration.bodyWeightKg = boundedNumber(calibration.w, state.calibration.bodyWeightKg, 1, 300);
+  state.calibration.baselinePreScigIggMgDl = boundedNumber(calibration.b, state.calibration.baselinePreScigIggMgDl, 0, 10000);
+  state.calibration.doseSlopeMgDlPer01GKgWeek = boundedNumber(calibration.s, state.calibration.doseSlopeMgDlPer01GKgWeek, 0, 5000);
+  state.calibration.peakToTroughRatio = boundedNumber(calibration.pr, state.calibration.peakToTroughRatio, 1, 5);
+  state.calibration.tmaxDaysAfterWeeklyInfusion = boundedNumber(calibration.tx, state.calibration.tmaxDaysAfterWeeklyInfusion, 0, 60);
+  state.calibration.labReferenceLowMgDl = boundedNumber(calibration.ll, state.calibration.labReferenceLowMgDl, 0, 10000);
+  state.calibration.labReferenceHighMgDl = boundedNumber(calibration.lh, state.calibration.labReferenceHighMgDl, 0, 10000);
+  state.calibration.highIggWarningThresholdMgDl = boundedNumber(calibration.hw, state.calibration.highIggWarningThresholdMgDl, 0, 10000);
+  state.calibration.baselineUncertaintyMgDl = boundedNumber(calibration.bu, state.calibration.baselineUncertaintyMgDl, 0, 5000);
+  state.calibration.slopeUncertaintyPercent = boundedNumber(calibration.su, state.calibration.slopeUncertaintyPercent, 0, 500);
+  state.calibration.absorptionHalfTimeLowDays = boundedNumber(calibration.al, state.calibration.absorptionHalfTimeLowDays, 0.1, 30);
+  state.calibration.absorptionHalfTimeHighDays = boundedNumber(calibration.ah, state.calibration.absorptionHalfTimeHighDays, 0.1, 30);
+  state.calibration.eliminationHalfLifeLowDays = boundedNumber(calibration.el, state.calibration.eliminationHalfLifeLowDays, 1, 365);
+  state.calibration.eliminationHalfLifeHighDays = boundedNumber(calibration.eh, state.calibration.eliminationHalfLifeHighDays, 1, 365);
+
+  if (payload.r) state.reference = expandRegimen(payload.r, "reference");
+  const sharedComparators = Array.isArray(payload.cs) ? payload.cs.slice(0, MAX_SHARED_COMPARATORS) : [];
+  if (sharedComparators.length) {
+    state.comparators = sharedComparators.map((comparator, index) => expandRegimen(comparator, `comp-${index + 1}`));
+  }
+  const comparatorIndexForSharedId = (sharedId) => sharedComparators.findIndex((comparator) => comparator?.i === sharedId);
+  const activeIndex = comparatorIndexForSharedId(payload.a);
+  const switchIndex = comparatorIndexForSharedId(payload.sw);
+  state.activeComparatorId = state.comparators[Math.max(0, activeIndex)]?.id || "comp-1";
+  state.switchComparatorId = state.comparators[Math.max(0, switchIndex)]?.id || state.activeComparatorId;
+  state.chartWindow = allowedValue(String(payload.cw), ["all", "60", "90", "180"], state.chartWindow);
+  state.chartMode = allowedValue(payload.cm, ["igg", "relative", "switch", "dose"], state.chartMode);
+  const interval = payload.x || {};
+  const intervalComparatorIndex = comparatorIndexForSharedId(interval.r);
+  state.interval.regimenId = interval.r === "reference"
+    ? "reference"
+    : (state.comparators[intervalComparatorIndex]?.id || "reference");
+  state.interval.horizonDays = allowedValue(Number(interval.h), [60, 90, 120, 180, 365], state.interval.horizonDays);
+  state.interval.checkpointDay = allowedValue(Number(interval.d), [7, 14, 21, 28], state.interval.checkpointDay);
+  state.interval.upperThresholdMgDl = boundedNumber(interval.u, state.interval.upperThresholdMgDl, 0, 10000);
+  state.interval.lowerThresholdMgDl = boundedNumber(interval.l, state.interval.lowerThresholdMgDl, 0, 10000);
+  return true;
+}
 
 function volumeToGrams(volumeMl, concentrationGPerMl) {
   return volumeMl * concentrationGPerMl;
@@ -606,6 +933,12 @@ function allocateCartridges(volumeMl, inventory) {
   return allocation.map((unit) => unit / 100).sort((a, b) => b - a);
 }
 
+function allocateProductCartridges(volumeMl, cartridgeSizesMl) {
+  const allocation = autoAllocateProductCartridges(volumeMl, cartridgeSizesMl);
+  if (Math.abs(Number(allocation.volumeMl) - Number(volumeMl)) > 0.01) return null;
+  return inventoryUnits(allocation.inventory).sort((a, b) => b - a);
+}
+
 function calibrationFactor(product) {
   const referenceSites = 4;
   const referenceVolumeMl = 50;
@@ -647,11 +980,14 @@ function computeRegimenMetrics(regimen, simulation, normalizedSimulation, refere
     return Array(Math.max(1, Number(event.sites))).fill(perSite);
   });
   const totalSites = regimen.events.reduce((sum, event) => sum + Number(event.sites), 0);
-  const remainingInventory = cloneInventory(product.cartridgeInventory);
+  const isReferenceRegimen = referenceMetrics === null;
+  const remainingReferenceInventory = isReferenceRegimen ? cloneInventory(product.cartridgeInventory) : null;
   const infusionTimes = eventGroups
     .sort((a, b) => a.day - b.day)
     .map((group) => {
-      const allocation = allocateCartridges(group.volumeMl, remainingInventory);
+      const allocation = isReferenceRegimen
+        ? allocateCartridges(group.volumeMl, remainingReferenceInventory)
+        : allocateProductCartridges(group.volumeMl, product.cartridgeSizesMl);
       return {
         day: group.day,
         volumeMl: group.volumeMl,
@@ -698,13 +1034,13 @@ function computeRegimenMetrics(regimen, simulation, normalizedSimulation, refere
 }
 
 function readDosingSettings() {
-  state.dosing.entryMode = $("doseEntryMode").value;
-  state.calibration.bodyWeightKg = Number($("bodyWeightKg").value);
-  state.dosing.protocolDoseGKgWeek = Number($("protocolDoseGKgWeek").value);
+  state.dosing.entryMode = allowedValue($("doseEntryMode").value, ["protocol", "total"], state.dosing.entryMode);
+  state.calibration.bodyWeightKg = boundedNumber($("bodyWeightKg").value, state.calibration.bodyWeightKg, 1, 300);
+  state.dosing.protocolDoseGKgWeek = boundedNumber($("protocolDoseGKgWeek").value, state.dosing.protocolDoseGKgWeek, 0, 5);
   state.dosing.requestedProtocolDoseGKgWeek = state.dosing.protocolDoseGKgWeek;
-  state.dosing.totalDoseUnit = $("totalDoseUnit").value;
-  state.dosing.totalDoseMl = Number($("totalDoseMl").value);
-  state.dosing.totalDoseG = Number($("totalDoseG").value);
+  state.dosing.totalDoseUnit = allowedValue($("totalDoseUnit").value, ["mL", "g"], state.dosing.totalDoseUnit);
+  state.dosing.totalDoseMl = boundedNumber($("totalDoseMl").value, state.dosing.totalDoseMl, 0, 5000);
+  state.dosing.totalDoseG = boundedNumber($("totalDoseG").value, state.dosing.totalDoseG, 0, 1000);
 
   const concentration = Math.max(Number(state.product.concentrationGPerMl), 0.0001);
   const weightKg = Math.max(Number(state.calibration.bodyWeightKg), 1);
@@ -725,9 +1061,10 @@ function readDosingSettings() {
   state.dosing.requestedWeeklyDoseG = requestedDoseG;
   const autoAllocation = autoAllocateProductCartridges(requestedDoseMl, state.product.cartridgeSizesMl);
   const targetDoseMl = autoAllocation.volumeMl;
-  if (state.product.cartridgeSelectionMode === "auto" || !$("cartridgePicker").querySelector("[data-cartridge-volume]")) {
+  const hasRenderedCartridgeControls = Boolean($("cartridgePicker").querySelector("[data-cartridge-volume]"));
+  if (state.product.cartridgeSelectionMode === "auto") {
     state.product.cartridgeInventory = autoAllocation.inventory;
-  } else {
+  } else if (hasRenderedCartridgeControls) {
     state.product.cartridgeInventory = readCartridgeSelection();
   }
   state.product.cartridgeInventoryText = inventoryTextFromInventory(state.product.cartridgeInventory);
@@ -759,57 +1096,66 @@ function generatedPresetById(presetId) {
   return presets.find((preset) => preset.presetId === presetId || preset.id === presetId);
 }
 
-function syncRegimenToGeneratedPreset(regimen) {
+function syncRegimenToGeneratedPreset(regimen, previousPresets = []) {
   if (!regimen.presetId || regimen.presetId === "custom") return;
   const generated = generatedPresetById(regimen.presetId);
   if (!generated) return;
+  const previousGenerated = previousPresets.find((preset) => preset.presetId === regimen.presetId || preset.id === regimen.presetId);
+  const customName = previousGenerated && regimen.name !== previousGenerated.name ? regimen.name : null;
   const id = regimen.id;
   Object.assign(regimen, structuredClone(generated), { id, presetId: generated.presetId });
+  if (customName) regimen.name = customName;
 }
 
 function refreshDoseGeneratedPresets() {
+  const previousPresets = presets;
   presets = buildPresets(state.dosing.weeklyDoseMl, state.product.cartridgeInventory);
-  syncRegimenToGeneratedPreset(state.reference);
-  state.comparators.forEach(syncRegimenToGeneratedPreset);
+  syncRegimenToGeneratedPreset(state.reference, previousPresets);
+  state.comparators.forEach((comparator) => syncRegimenToGeneratedPreset(comparator, previousPresets));
 }
 
 function readSettings() {
-  state.product.presetId = $("productPreset").value;
-  state.product.name = $("productName").value.trim() || "SCIG example";
-  state.product.concentrationGPerMl = Number($("concentration").value);
-  state.product.needleType = $("needleType").value;
-  state.product.tubing = $("tubing").value;
+  state.product.presetId = allowedValue($("productPreset").value, [...Object.keys(productPresets), "custom"], state.product.presetId);
+  state.product.name = safeLabel($("productName").value, state.product.name || "SCIG example");
+  state.product.concentrationGPerMl = boundedNumber($("concentration").value, state.product.concentrationGPerMl, 0.01, 1);
+  state.product.needleType = allowedValue($("needleType").value, ["highFlo26G"], state.product.needleType);
+  state.product.tubing = allowedValue($("tubing").value, Object.keys(exampleScigFlowTable26G.tubing), state.product.tubing);
   if (productPresets[state.product.presetId]) {
     state.product.cartridgeSizesMl = productPresets[state.product.presetId].cartridgeSizesMl;
   }
-  state.product.referenceRunMinutes = Number($("referenceRunMinutes").value);
+  state.product.referenceRunMinutes = boundedNumber($("referenceRunMinutes").value, state.product.referenceRunMinutes, 1, 1440);
   readDosingSettings();
   refreshDoseGeneratedPresets();
-  state.params.absorptionHalfTimeDays = Number($("absorptionHalfTime").value);
-  state.params.eliminationHalfLifeDays = Number($("eliminationHalfLife").value);
-  state.params.simulationHorizonDays = Number($("simulationHorizon").value);
-  state.params.timestepDays = Number($("timestep").value);
-  state.params.switchPreconditionDays = Number($("switchPreconditionDays").value);
-  state.params.switchHorizonDays = Number($("switchHorizonDays").value);
-  state.calibration.mode = $("iggScenarioMode").value;
-  state.calibration.baselinePreScigIggMgDl = Number($("baselinePreScigIgg").value);
-  state.calibration.doseSlopeMgDlPer01GKgWeek = Number($("doseSlope").value);
-  state.calibration.peakToTroughRatio = Number($("peakToTroughRatio").value);
-  state.calibration.tmaxDaysAfterWeeklyInfusion = Number($("modelTmaxDays").value);
-  state.calibration.labReferenceLowMgDl = Number($("labReferenceLow").value);
-  state.calibration.labReferenceHighMgDl = Number($("labReferenceHigh").value);
-  state.calibration.highIggWarningThresholdMgDl = Number($("highIggWarningThreshold").value);
-  state.calibration.baselineUncertaintyMgDl = Number($("baselineUncertainty").value);
-  state.calibration.slopeUncertaintyPercent = Number($("slopeUncertaintyPercent").value);
-  state.calibration.customCalibrationIggMgDl = Number($("customCalibrationIgg").value);
-  state.calibration.absorptionHalfTimeLowDays = Number($("absorptionHalfTimeLow").value);
-  state.calibration.absorptionHalfTimeHighDays = Number($("absorptionHalfTimeHigh").value);
-  state.calibration.eliminationHalfLifeLowDays = Number($("eliminationHalfLifeLow").value);
-  state.calibration.eliminationHalfLifeHighDays = Number($("eliminationHalfLifeHigh").value);
+  state.params.absorptionHalfTimeDays = boundedNumber($("absorptionHalfTime").value, state.params.absorptionHalfTimeDays, 0.1, 30);
+  state.params.eliminationHalfLifeDays = boundedNumber($("eliminationHalfLife").value, state.params.eliminationHalfLifeDays, 1, 365);
+  state.params.simulationHorizonDays = allowedValue(Number($("simulationHorizon").value), [90, 180, 365], state.params.simulationHorizonDays);
+  state.params.timestepDays = allowedValue(Number($("timestep").value), [0.25, 0.5], state.params.timestepDays);
+  state.params.switchPreconditionDays = boundedNumber($("switchPreconditionDays").value, state.params.switchPreconditionDays, 0, 3650);
+  state.params.switchHorizonDays = boundedNumber($("switchHorizonDays").value, state.params.switchHorizonDays, 14, 730);
+  state.calibration.mode = allowedValue($("iggScenarioMode").value, Object.keys(iggScenarioPresets), state.calibration.mode);
+  state.calibration.baselinePreScigIggMgDl = boundedNumber($("baselinePreScigIgg").value, state.calibration.baselinePreScigIggMgDl, 0, 10000);
+  state.calibration.doseSlopeMgDlPer01GKgWeek = boundedNumber($("doseSlope").value, state.calibration.doseSlopeMgDlPer01GKgWeek, 0, 5000);
+  state.calibration.peakToTroughRatio = boundedNumber($("peakToTroughRatio").value, state.calibration.peakToTroughRatio, 1, 5);
+  state.calibration.tmaxDaysAfterWeeklyInfusion = boundedNumber($("modelTmaxDays").value, state.calibration.tmaxDaysAfterWeeklyInfusion, 0, 60);
+  state.calibration.labReferenceLowMgDl = boundedNumber($("labReferenceLow").value, state.calibration.labReferenceLowMgDl, 0, 10000);
+  state.calibration.labReferenceHighMgDl = boundedNumber($("labReferenceHigh").value, state.calibration.labReferenceHighMgDl, 0, 10000);
+  state.calibration.highIggWarningThresholdMgDl = boundedNumber($("highIggWarningThreshold").value, state.calibration.highIggWarningThresholdMgDl, 0, 10000);
+  state.calibration.baselineUncertaintyMgDl = boundedNumber($("baselineUncertainty").value, state.calibration.baselineUncertaintyMgDl, 0, 5000);
+  state.calibration.slopeUncertaintyPercent = boundedNumber($("slopeUncertaintyPercent").value, state.calibration.slopeUncertaintyPercent, 0, 500);
+  state.calibration.absorptionHalfTimeLowDays = boundedNumber($("absorptionHalfTimeLow").value, state.calibration.absorptionHalfTimeLowDays, 0.1, 30);
+  state.calibration.absorptionHalfTimeHighDays = boundedNumber($("absorptionHalfTimeHigh").value, state.calibration.absorptionHalfTimeHighDays, 0.1, 30);
+  state.calibration.eliminationHalfLifeLowDays = boundedNumber($("eliminationHalfLifeLow").value, state.calibration.eliminationHalfLifeLowDays, 1, 365);
+  state.calibration.eliminationHalfLifeHighDays = boundedNumber($("eliminationHalfLifeHigh").value, state.calibration.eliminationHalfLifeHighDays, 1, 365);
   if ($("switchComparator")) {
-    state.switchComparatorId = $("switchComparator").value;
+    state.switchComparatorId = allowedValue($("switchComparator").value, state.comparators.map((comparator) => comparator.id), state.switchComparatorId);
   }
-  state.chartWindow = $("chartWindow").value;
+  if ($("intervalRegimen")) {
+    state.interval.regimenId = allowedValue($("intervalRegimen").value, ["reference", ...state.comparators.map((comparator) => comparator.id)], state.interval.regimenId);
+    state.interval.horizonDays = allowedValue(Number($("intervalHorizonDays").value), [60, 90, 120, 180, 365], state.interval.horizonDays);
+    state.interval.upperThresholdMgDl = boundedNumber($("intervalUpperThreshold").value, state.interval.upperThresholdMgDl, 0, 10000);
+    state.interval.lowerThresholdMgDl = boundedNumber($("intervalLowerThreshold").value, state.interval.lowerThresholdMgDl, 0, 10000);
+  }
+  state.chartWindow = allowedValue($("chartWindow").value, ["all", "60", "90", "180"], state.chartWindow);
 }
 
 function selectedCartridgeVolume(inventory) {
@@ -827,6 +1173,51 @@ function readCartridgeSelection() {
     counts[input.dataset.cartridgeVolume] = Number(input.value);
   });
   return inventoryFromCounts(counts);
+}
+
+function setControlValue(id, value) {
+  const control = $(id);
+  if (control) control.value = value;
+}
+
+function syncFormControlsFromState() {
+  setControlValue("productPreset", state.product.presetId);
+  setControlValue("productName", state.product.name);
+  setControlValue("concentration", formatNumber(state.product.concentrationGPerMl, 2));
+  setControlValue("needleType", state.product.needleType);
+  setControlValue("tubing", state.product.tubing);
+  setControlValue("referenceRunMinutes", formatNumber(state.product.referenceRunMinutes, 0));
+  setControlValue("doseEntryMode", state.dosing.entryMode);
+  setControlValue("bodyWeightKg", formatNumber(state.calibration.bodyWeightKg, 0));
+  setControlValue("protocolDoseGKgWeek", formatNumber(state.dosing.protocolDoseGKgWeek, 3));
+  setControlValue("totalDoseUnit", state.dosing.totalDoseUnit);
+  setControlValue("totalDoseMl", formatNumber(state.dosing.totalDoseMl, 1));
+  setControlValue("totalDoseG", formatNumber(state.dosing.totalDoseG, 1));
+  setControlValue("absorptionHalfTime", formatNumber(state.params.absorptionHalfTimeDays, 1));
+  setControlValue("eliminationHalfLife", formatNumber(state.params.eliminationHalfLifeDays, 0));
+  setControlValue("simulationHorizon", String(state.params.simulationHorizonDays));
+  setControlValue("timestep", String(state.params.timestepDays));
+  setControlValue("iggScenarioMode", state.calibration.mode);
+  setControlValue("baselinePreScigIgg", formatNumber(state.calibration.baselinePreScigIggMgDl, 0));
+  setControlValue("doseSlope", formatNumber(state.calibration.doseSlopeMgDlPer01GKgWeek, 0));
+  setControlValue("peakToTroughRatio", formatNumber(state.calibration.peakToTroughRatio, 2));
+  setControlValue("modelTmaxDays", formatNumber(state.calibration.tmaxDaysAfterWeeklyInfusion, 2));
+  setControlValue("labReferenceLow", formatNumber(state.calibration.labReferenceLowMgDl, 0));
+  setControlValue("labReferenceHigh", formatNumber(state.calibration.labReferenceHighMgDl, 0));
+  setControlValue("highIggWarningThreshold", formatNumber(state.calibration.highIggWarningThresholdMgDl, 0));
+  setControlValue("baselineUncertainty", formatNumber(state.calibration.baselineUncertaintyMgDl, 0));
+  setControlValue("slopeUncertaintyPercent", formatNumber(state.calibration.slopeUncertaintyPercent, 0));
+  setControlValue("absorptionHalfTimeLow", formatNumber(state.calibration.absorptionHalfTimeLowDays, 1));
+  setControlValue("absorptionHalfTimeHigh", formatNumber(state.calibration.absorptionHalfTimeHighDays, 1));
+  setControlValue("eliminationHalfLifeLow", formatNumber(state.calibration.eliminationHalfLifeLowDays, 0));
+  setControlValue("eliminationHalfLifeHigh", formatNumber(state.calibration.eliminationHalfLifeHighDays, 0));
+  setControlValue("switchPreconditionDays", formatNumber(state.params.switchPreconditionDays, 0));
+  setControlValue("switchHorizonDays", formatNumber(state.params.switchHorizonDays, 0));
+  setControlValue("intervalRegimen", state.interval.regimenId);
+  setControlValue("intervalHorizonDays", String(state.interval.horizonDays));
+  setControlValue("intervalUpperThreshold", formatNumber(state.interval.upperThresholdMgDl, 0));
+  setControlValue("intervalLowerThreshold", formatNumber(state.interval.lowerThresholdMgDl, 0));
+  setControlValue("chartWindow", state.chartWindow);
 }
 
 function renderCartridgePicker() {
@@ -898,7 +1289,7 @@ function regimenCard(role, regimen, metrics) {
     .join(" · ");
   const metricsText = metrics
     ? `${formatNumber(metrics.percentReferenceDoseIntensity, 1)}% of reference · max ${formatNumber(metrics.maxMlPerSite, 1)} mL/site`
-    : `${formatNumber(regimen.cycleLengthDays, 1)} day cycle`;
+    : `${formatNumber(regimen.cycleLengthDays, 0)} day cycle`;
   return `
     <div class="regimen-card">
       <div>
@@ -908,7 +1299,7 @@ function regimenCard(role, regimen, metrics) {
       <div class="regimen-card-metrics">
         <b>${formatNumber(totalMl, 0)} mL</b>
         <b>${formatDose(totalG)}</b>
-        <b>${formatNumber(regimen.cycleLengthDays, 1)} days</b>
+        <b>${formatNumber(regimen.cycleLengthDays, 0)} days</b>
       </div>
       <p>${escapeHtml(eventText)}</p>
       <small>${escapeHtml(metricsText)}</small>
@@ -947,7 +1338,6 @@ function applyIggScenarioPreset(mode) {
   $("peakToTroughRatio").value = formatNumber(preset.peakToTroughRatio, 2);
   $("modelTmaxDays").value = preset.tmaxDaysAfterWeeklyInfusion;
   $("highIggWarningThreshold").value = preset.highIggWarningThresholdMgDl;
-  $("customCalibrationIgg").value = preset.customCalibrationIggMgDl;
 }
 
 function renderDoseSetupSummary() {
@@ -997,45 +1387,131 @@ function activeComparator() {
   return state.comparators.find((comparator) => comparator.id === state.activeComparatorId) || state.comparators[0];
 }
 
+function editingComparator() {
+  return state.comparators.find((comparator) => comparator.id === editingComparatorId) || null;
+}
+
 function switchComparator() {
   return state.comparators.find((comparator) => comparator.id === state.switchComparatorId) || activeComparator();
 }
 
+function intervalRegimen() {
+  if (state.interval.regimenId === "reference") return state.reference;
+  return state.comparators.find((comparator) => comparator.id === state.interval.regimenId) || state.reference;
+}
+
 function renderPresetSelect(select, includeLabel = true) {
-  select.innerHTML = `${includeLabel ? '<option value="">Select preset</option>' : ""}${presets.map((preset) => (
-    `<option value="${preset.id}">${preset.name}</option>`
+  select.innerHTML = `${includeLabel ? '<option value="">Choose a generated schedule...</option>' : ""}${presets.map((preset) => (
+    `<option value="${preset.id}">${escapeHtml(preset.name)}</option>`
   )).join("")}`;
+}
+
+function renderGeneratedPresetControls() {
+  renderPresetSelect($("referencePreset"));
+  renderPresetSelect($("candidatePreset"));
+  if (presets.some((preset) => preset.id === pendingReferencePresetId)) {
+    $("referencePreset").value = pendingReferencePresetId;
+  } else {
+    pendingReferencePresetId = "";
+  }
+  if (presets.some((preset) => preset.id === pendingComparatorPresetId)) {
+    $("candidatePreset").value = pendingComparatorPresetId;
+  } else {
+    pendingComparatorPresetId = "";
+  }
+  const selectedReferencePreset = presets.find((preset) => preset.id === pendingReferencePresetId);
+  $("applyReferencePreset").disabled = !selectedReferencePreset;
+  $("applyReferencePreset").textContent = selectedReferencePreset
+    ? "Apply preset"
+    : "Choose a preset";
+  $("referencePresetTarget").innerHTML = selectedReferencePreset
+    ? `Ready to replace <strong>${escapeHtml(state.reference.name)}</strong> with <strong>${escapeHtml(selectedReferencePreset.name)}</strong>.`
+    : "Choose a generated schedule, then click Apply.";
+  const target = editingComparator() || activeComparator();
+  const selectedPreset = presets.find((preset) => preset.id === pendingComparatorPresetId);
+  $("applyCandidatePreset").disabled = !selectedPreset;
+  $("applyCandidatePreset").textContent = selectedPreset
+    ? `Apply to ${target.name}`
+    : "Choose a preset";
+  $("candidatePresetTarget").innerHTML = selectedPreset
+    ? `Ready to replace <strong>${escapeHtml(target.name)}</strong> with <strong>${escapeHtml(selectedPreset.name)}</strong>.`
+    : `Choose a generated schedule for <strong>${escapeHtml(target.name)}</strong>, then click Apply.`;
+}
+
+function renderEditingGuidance() {
+  const entryMode = state.dosing.entryMode;
+  const totalUnit = state.dosing.totalDoseUnit;
+  const isCustomPatient = state.calibration.mode === "custom";
+  $("doseSetupPanel").hidden = !isCustomPatient;
+  document.querySelectorAll("[data-dose-entry]").forEach((label) => {
+    const visibleForMode = label.dataset.doseEntry === entryMode;
+    const visibleForUnit = !label.dataset.totalDoseUnit || label.dataset.totalDoseUnit === totalUnit;
+    label.hidden = !(visibleForMode && visibleForUnit);
+  });
+
+  const scenario = iggScenarioPresets[state.calibration.mode] || iggScenarioPresets.replacement;
+  $("scenarioDoseEffect").innerHTML = isCustomPatient
+    ? `Custom dose controls are open below. Current product-rounded reference: <strong>${formatDose(state.dosing.weeklyDoseG)} / ${formatNumber(state.dosing.weeklyDoseMl, 1)} mL every 7 days</strong>.`
+    : `<strong>${formatNumber(scenario.protocolDoseGKgWeek, 2)} g/kg/week</strong> at ${formatNumber(state.calibration.bodyWeightKg, 0)} kg generates a product-rounded reference of <strong>${formatDose(state.dosing.weeklyDoseG)} / ${formatNumber(state.dosing.weeklyDoseMl, 1)} mL every 7 days</strong>.`;
+  $("iggAdvancedHint").textContent = `Baseline ${formatMgDl(state.calibration.baselinePreScigIggMgDl)} · peak/trough ${formatNumber(state.calibration.peakToTroughRatio, 2)} · warning ${formatMgDl(state.calibration.highIggWarningThresholdMgDl)}`;
+  $("referenceRegimenHelp").innerHTML = `Generated from the current <strong>${formatDose(state.dosing.weeklyDoseG)} / ${formatNumber(state.dosing.weeklyDoseMl, 1)} mL</strong> dose. Every comparator is measured against this schedule.`;
+  $("selectedComparatorName").textContent = (editingComparator() || activeComparator()).name;
 }
 
 function renderComparatorSelect() {
   if (!state.comparators.some((comparator) => comparator.id === state.switchComparatorId)) {
     state.switchComparatorId = activeComparator().id;
   }
-  $("comparatorManager").innerHTML = state.comparators.map((comparator, index) => `
-    <div class="comparator-row ${comparator.id === state.activeComparatorId ? "active" : ""}">
+  $("comparatorManager").innerHTML = state.comparators.map((comparator, index) => {
+    const totalMl = comparator.events.reduce((sum, event) => sum + Number(event.volumeMl), 0);
+    const active = comparator.id === editingComparatorId;
+    return `
+    <div class="comparator-row ${active ? "active" : ""}">
       <span class="comparator-index">${index + 1}</span>
-      <input
-        data-comparator-id="${comparator.id}"
-        data-comparator-field="name"
-        type="text"
-        aria-label="Comparator ${index + 1} name"
-        value="${escapeHtml(comparator.name)}"
-      >
-      <button class="secondary" data-action="select-comparator" data-comparator-id="${comparator.id}" type="button">Edit</button>
-      <button class="icon-button" data-action="move-comparator-up" data-comparator-id="${comparator.id}" ${index === 0 ? "disabled" : ""} type="button">Up</button>
-      <button class="icon-button" data-action="move-comparator-down" data-comparator-id="${comparator.id}" ${index === state.comparators.length - 1 ? "disabled" : ""} type="button">Down</button>
-      <button class="icon-button" data-action="remove-comparator" data-comparator-id="${comparator.id}" ${state.comparators.length === 1 ? "disabled" : ""} type="button">Remove</button>
+      <div class="comparator-summary">
+        <strong>${escapeHtml(comparator.name)}</strong>
+        <small>${formatNumber(totalMl, 1)} mL over ${formatNumber(comparator.cycleLengthDays, 0)} days · ${comparator.events.length} dose event${comparator.events.length === 1 ? "" : "s"}</small>
+      </div>
+      <div class="comparator-row-actions">
+        <button class="${active ? "selected-control" : "secondary"}" data-action="select-comparator" data-comparator-id="${comparator.id}" ${active ? "disabled" : ""} type="button">${active ? "Editing now" : "Edit this"}</button>
+        <button class="icon-button" aria-label="Move comparator ${index + 1} up" data-action="move-comparator-up" data-comparator-id="${comparator.id}" ${index === 0 ? "disabled" : ""} type="button">↑</button>
+        <button class="icon-button" aria-label="Move comparator ${index + 1} down" data-action="move-comparator-down" data-comparator-id="${comparator.id}" ${index === state.comparators.length - 1 ? "disabled" : ""} type="button">↓</button>
+        <button class="icon-button danger-button" aria-label="Remove comparator ${index + 1}" data-action="remove-comparator" data-comparator-id="${comparator.id}" ${state.comparators.length === 1 ? "disabled" : ""} type="button">Remove</button>
+      </div>
     </div>
-  `).join("");
+  `;
+  }).join("");
 
   $("switchComparator").innerHTML = state.comparators.map((comparator, index) => (
     `<option value="${comparator.id}">Comparator ${index + 1}: ${escapeHtml(comparator.name)}</option>`
   )).join("");
   $("switchComparator").value = state.switchComparatorId;
+
+  const intervalIds = ["reference", ...state.comparators.map((comparator) => comparator.id)];
+  if (!intervalIds.includes(state.interval.regimenId)) state.interval.regimenId = "reference";
+  $("intervalRegimen").innerHTML = [
+    `<option value="reference">Reference: ${escapeHtml(state.reference.name)}</option>`,
+    ...state.comparators.map((comparator, index) => (
+      `<option value="${comparator.id}">Comparator ${index + 1}: ${escapeHtml(comparator.name)}</option>`
+    )),
+  ].join("");
+  $("intervalRegimen").value = state.interval.regimenId;
+  const editorOpen = Boolean(editingComparator());
+  $("comparatorPresetStep").hidden = !editorOpen;
+  $("comparatorEditorStep").hidden = !editorOpen;
 }
 
 function renderRegimenEditor(container, regimen, type) {
+  const eventCount = regimen.events.length;
+  const eventLabel = eventCount === 1 ? "dose day" : "dose days";
+  const appliedNotice = editedRegimens.has(regimen) ? `
+    <div class="auto-apply-note" role="status">
+      <span class="auto-apply-check" aria-hidden="true">✓</span>
+      <div><strong>Changes applied automatically</strong><small>This schedule and its results are up to date.</small></div>
+    </div>
+  ` : "";
   container.innerHTML = `
+    ${appliedNotice}
     <div class="regimen-fields">
       <label>
         Regimen name
@@ -1043,10 +1519,11 @@ function renderRegimenEditor(container, regimen, type) {
       </label>
       <label>
         Cycle length (days)
-        <input data-type="${type}" data-field="cycleLengthDays" type="number" min="0.25" step="0.25" value="${regimen.cycleLengthDays}">
+        <input data-type="${type}" data-field="cycleLengthDays" type="number" min="1" step="1" inputmode="numeric" value="${wholeCycleDays(regimen.cycleLengthDays)}">
       </label>
     </div>
-    <table class="event-table">
+    <div class="event-table-wrap">
+    <table class="event-table" aria-label="${type === "reference" ? "Reference" : "Selected comparator"} dose events">
       <thead>
         <tr>
           <th>Day</th>
@@ -1061,9 +1538,16 @@ function renderRegimenEditor(container, regimen, type) {
         ${regimen.events.map((event, index) => eventRow(regimen, event, index, type)).join("")}
       </tbody>
     </table>
+    </div>
     <div class="event-actions">
-      <span class="pill">${round(regimen.events.reduce((sum, event) => sum + Number(event.volumeMl), 0), 0)} mL per cycle</span>
-      <button class="secondary" data-type="${type}" data-action="add-event" type="button">Add Event</button>
+      <div class="event-actions-summary">
+        <span class="pill">${round(regimen.events.reduce((sum, event) => sum + Number(event.volumeMl), 0), 0)} mL per cycle</span>
+        <small>${eventCount} ${eventLabel} already shown above</small>
+      </div>
+      <div class="add-dose-day-control">
+        <button class="secondary" data-type="${type}" data-action="add-event" type="button">+ Add another dose day</button>
+        <small>Use for split schedules with more than one infusion day per cycle.</small>
+      </div>
     </div>
   `;
 }
@@ -1074,12 +1558,12 @@ function eventRow(regimen, event, index, type) {
   const disableRemove = regimen.events.length === 1 ? "disabled" : "";
   return `
     <tr>
-      <td><input data-type="${type}" data-event-index="${index}" data-field="day" type="number" min="0" step="0.25" value="${event.day}"></td>
-      <td><input data-type="${type}" data-event-index="${index}" data-field="volumeMl" type="number" min="0" step="1" value="${event.volumeMl}"></td>
-      <td><input data-type="${type}" data-event-index="${index}" data-field="sites" type="number" min="1" max="8" step="1" value="${event.sites}"></td>
-      <td>${formatDose(dose)}</td>
-      <td>${formatNumber(mlPerSite, 1)}</td>
-      <td><button class="icon-button" data-type="${type}" data-event-index="${index}" data-action="remove-event" ${disableRemove} type="button">Remove</button></td>
+      <td data-label="Day"><input aria-label="Dose event ${index + 1} day" data-type="${type}" data-event-index="${index}" data-field="day" type="number" min="0" step="0.25" value="${event.day}"></td>
+      <td data-label="Volume (mL)"><input aria-label="Dose event ${index + 1} volume in mL" data-type="${type}" data-event-index="${index}" data-field="volumeMl" type="number" min="0" step="1" value="${event.volumeMl}"></td>
+      <td data-label="Sites"><input aria-label="Dose event ${index + 1} sites" data-type="${type}" data-event-index="${index}" data-field="sites" type="number" min="1" max="8" step="1" value="${event.sites}"></td>
+      <td data-label="Dose">${formatDose(dose)}</td>
+      <td data-label="mL/site">${formatNumber(mlPerSite, 1)}</td>
+      <td data-label="Action"><button class="icon-button" data-type="${type}" data-event-index="${index}" data-action="remove-event" ${disableRemove} type="button">Remove</button></td>
     </tr>
   `;
 }
@@ -1092,11 +1576,27 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
-function updateRegimenFromInput(input) {
-  const regimen = input.dataset.type === "reference" ? state.reference : activeComparator();
+function simpleGeneratedRegimenName(regimen) {
+  if (regimen.events.length !== 1 || Number(regimen.events[0].day) !== 0) return null;
+  const totalVolumeMl = Number(regimen.events[0].volumeMl);
+  if (!Number.isFinite(totalVolumeMl)) return null;
+  return `${doseName(totalVolumeMl)} every ${wholeCycleDays(regimen.cycleLengthDays)} days`;
+}
+
+function updateRegimenFromInput(input, { commit = true } = {}) {
+  const regimen = input.dataset.type === "reference" ? state.reference : (editingComparator() || activeComparator());
+  editedRegimens.add(regimen);
   const field = input.dataset.field;
   const eventIndex = input.dataset.eventIndex;
-  const value = input.type === "number" ? Number(input.value) : input.value;
+  const rawValue = input.type === "number" ? Number(input.value) : input.value;
+  if (input.type === "number" && !Number.isFinite(rawValue)) return;
+  const generatedNameBeforeEdit = simpleGeneratedRegimenName(regimen);
+  const shouldRefreshGeneratedName = regimen.name === generatedNameBeforeEdit;
+  const value = field === "cycleLengthDays" && commit
+    ? wholeCycleDays(rawValue, regimen.cycleLengthDays)
+    : rawValue;
+
+  if (field === "cycleLengthDays" && commit) input.value = String(value);
 
   if (eventIndex === undefined) {
     regimen[field] = value;
@@ -1105,16 +1605,25 @@ function updateRegimenFromInput(input) {
     regimen.events[Number(eventIndex)][field] = value;
     regimen.presetId = "custom";
   }
+
+  if (shouldRefreshGeneratedName && ["cycleLengthDays", "volumeMl"].includes(field)) {
+    regimen.name = simpleGeneratedRegimenName(regimen) || regimen.name;
+  }
 }
 
 function addEvent(type) {
-  const regimen = type === "reference" ? state.reference : activeComparator();
-  regimen.events.push({ day: 0, volumeMl: 10, sites: 1 });
+  const regimen = type === "reference" ? state.reference : (editingComparator() || activeComparator());
+  editedRegimens.add(regimen);
+  const cycleEnd = Math.max(0, Number(regimen.cycleLengthDays) - 0.25);
+  const latestDay = Math.max(...regimen.events.map((event) => Number(event.day)));
+  const nextDay = Math.min(cycleEnd, latestDay + 1);
+  regimen.events.push({ day: nextDay, volumeMl: 10, sites: 1 });
   regimen.presetId = "custom";
 }
 
 function removeEvent(type, index) {
-  const regimen = type === "reference" ? state.reference : activeComparator();
+  const regimen = type === "reference" ? state.reference : (editingComparator() || activeComparator());
+  editedRegimens.add(regimen);
   if (regimen.events.length > 1) regimen.events.splice(index, 1);
   regimen.presetId = "custom";
 }
@@ -1144,17 +1653,31 @@ function removeComparator(id) {
     const fallback = state.comparators[Math.min(index, state.comparators.length - 1)];
     state.activeComparatorId = fallback.id;
   }
+  if (editingComparatorId === id) editingComparatorId = null;
   if (state.switchComparatorId === id) {
     const fallback = state.comparators[Math.min(index, state.comparators.length - 1)];
     state.switchComparatorId = fallback.id;
   }
+  if (state.interval.regimenId === id) state.interval.regimenId = "reference";
 }
 
 function runSimulation() {
+  const activeEditorId = document.activeElement?.closest?.("#referenceEditor, #candidateEditor")?.id || null;
   readSettings();
+  state.reference.cycleLengthDays = wholeCycleDays(state.reference.cycleLengthDays, 7);
+  state.comparators.forEach((comparator) => {
+    comparator.cycleLengthDays = wholeCycleDays(comparator.cycleLengthDays, 7);
+  });
+  amplitudeSummaryCache = new WeakMap();
+  calibrationScenarioCache = null;
+  scenarioScaleCache = new Map();
   renderCartridgePicker();
   renderDoseSetupSummary();
   renderSetupSnapshot();
+  renderComparatorSelect();
+  renderGeneratedPresetControls();
+  renderEditingGuidance();
+  renderSharePanel();
   if (!state.product.cartridgeSelectionValid) {
     renderBlockedSimulation();
     return;
@@ -1171,19 +1694,28 @@ function runSimulation() {
     return { regimen: comparator, raw, normalized, metrics };
   });
 
-  renderRegimenEditor($("referenceEditor"), state.reference, "reference");
-  renderComparatorSelect();
-  renderRegimenEditor($("candidateEditor"), activeComparator(), "candidate");
+  if (activeEditorId !== "referenceEditor") {
+    renderRegimenEditor($("referenceEditor"), state.reference, "reference");
+  }
+  const comparatorBeingEdited = editingComparator();
+  if (comparatorBeingEdited) {
+    if (activeEditorId !== "candidateEditor") {
+      renderRegimenEditor($("candidateEditor"), comparatorBeingEdited, "candidate");
+    }
+  } else {
+    $("candidateEditor").innerHTML = "";
+  }
   renderRegimenCards(comparatorSims);
   renderResults(referenceMetrics, comparatorSims);
   renderAssumptionAudit();
   renderIggScenarioSummary();
   renderAmplitudeEstimate(comparatorSims);
+  if (intervalExplorerActive) renderExtendedInterval();
   renderChart(referenceSim, comparatorSims);
   renderSwitchScenario(referenceRawStats.average);
-  renderAnalysis(referenceSim, comparatorSims, referenceRawStats.average);
   renderTimeline(state.reference, comparatorSims);
   renderChartMode();
+  renderPrintReport();
 }
 
 function renderBlockedSimulation() {
@@ -1200,15 +1732,15 @@ function renderBlockedSimulation() {
       <button class="secondary" data-action="auto-fill-cartridges" type="button">Auto-fill to target</button>
     </div>
   `;
-  $("interpretation").innerHTML = message;
-  $("resultsTable").innerHTML = "";
-  $("resultsDashboard").innerHTML = "";
-  $("deltaNarratives").innerHTML = "";
+  $("resultsTable").innerHTML = message;
   $("assumptionAudit").innerHTML = "";
-  $("compareBar").innerHTML = "";
   $("amplitudeSummary").innerHTML = `<div class="analysis-block"><p>${message}</p></div>`;
+  $("intervalSummary").innerHTML = `<div class="summary-tile"><strong>Resolve the cartridge total to model an extended interval.</strong></div>`;
+  $("intervalCrossings").innerHTML = "";
+  $("intervalCheckpoints").innerHTML = "";
   $("timeline").innerHTML = "";
   $("iggScenarioSummary").innerHTML = "";
+  renderPrintReport();
   if (exposureChart) {
     exposureChart.destroy();
     exposureChart = null;
@@ -1219,51 +1751,263 @@ function renderBlockedSimulation() {
   }
 }
 
+function generateShareQr(shareUrl) {
+  if (typeof qrcode !== "function") {
+    $("shareQr").innerHTML = '<span class="qr-fallback">QR unavailable</span>';
+    return false;
+  }
+  const qr = qrcode(0, "M");
+  qr.addData(shareUrl);
+  qr.make();
+  $("shareQr").innerHTML = qr.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
+  $("shareQr").dataset.shareUrl = shareUrl;
+  return true;
+}
+
+function renderSharePanel({ forceQr = false } = {}) {
+  if (!$("shareUrl")) return;
+  let shareUrl = "";
+  let status = "Share link ready.";
+  try {
+    shareUrl = buildShareUrl();
+    const token = readShareTokenFromUrl() || encodeSharePayload(serializeSimulatorState());
+    status = `Share link ready · ${token.length} encoded characters.`;
+  } catch (error) {
+    status = `Could not generate share link: ${error.message}`;
+  }
+
+  $("shareUrl").value = shareUrl;
+  $("shareStatus").textContent = status;
+  if (!shareUrl) return;
+
+  if (shareQrTimer) {
+    window.clearTimeout(shareQrTimer);
+    shareQrTimer = null;
+  }
+  const sharePanel = document.querySelector(".share-panel");
+  if (!forceQr && sharePanel?.tagName === "DETAILS" && !sharePanel.open) return;
+  const hasQr = Boolean($("shareQr").querySelector("svg"));
+  if (forceQr || !hasQr) {
+    generateShareQr(shareUrl);
+    return;
+  }
+  if ($("shareQr").dataset.shareUrl === shareUrl) return;
+  $("shareStatus").textContent = `${status} QR updating...`;
+  shareQrTimer = window.setTimeout(() => {
+    if ($("shareUrl").value !== shareUrl) return;
+    generateShareQr(shareUrl);
+    $("shareStatus").textContent = status;
+    shareQrTimer = null;
+  }, 220);
+}
+
+function formatExportDate(date = new Date()) {
+  const month = date.toLocaleString("en-US", { month: "short" });
+  return `${month}-${date.getDate()}-${date.getFullYear()}`;
+}
+
+function formatReportDate(date = new Date()) {
+  return date.toLocaleDateString("en-US", {
+    month: "long",
+    day: "numeric",
+    year: "numeric",
+  });
+}
+
+function printPageFooter(sectionLabel) {
+  return `
+    <footer class="print-page-footer">
+      <span>SCIG Schedule Simulator v${APP_VERSION}</span>
+      <a href="${REPOSITORY_URL}">${REPOSITORY_LABEL}</a>
+      <span>${escapeHtml(sectionLabel)}</span>
+    </footer>
+  `;
+}
+
+function printRegimenRows() {
+  return [
+    { role: "Reference", regimen: state.reference },
+    ...state.comparators.map((regimen, index) => ({ role: `Comparator ${index + 1}`, regimen })),
+  ].map(({ role, regimen }) => {
+    const totalVolumeMl = regimen.events.reduce((sum, event) => sum + Number(event.volumeMl), 0);
+    const totalDoseG = volumeToGrams(totalVolumeMl, state.product.concentrationGPerMl);
+    const events = regimen.events.map((event) => (
+      `Day ${formatNumber(event.day, Number.isInteger(Number(event.day)) ? 0 : 1)}: ${formatNumber(Number(event.volumeMl), 1)} mL across ${formatNumber(Number(event.sites), 0)} site${Number(event.sites) === 1 ? "" : "s"}`
+    )).join("; ");
+    return `
+      <tr>
+        <td><span class="print-role">${role}</span><strong>${escapeHtml(regimen.name)}</strong></td>
+        <td>${formatNumber(regimen.cycleLengthDays, 0)} days</td>
+        <td>${formatNumber(totalVolumeMl, 1)} mL<br><small>${formatDose(totalDoseG)}</small></td>
+        <td>${escapeHtml(events)}</td>
+      </tr>
+    `;
+  }).join("");
+}
+
+function renderPrintCharts() {
+  const chartSize = { renderWidth: 1000, renderHeight: 410 };
+  const chartPairs = [
+    ["amplitudeBandChart", "printAmplitudeBandChart"],
+    ["amplitudeSwitchChart", "printAmplitudeSwitchChart"],
+    ["intervalChart", "printIntervalChart"],
+  ];
+  chartPairs.forEach(([sourceId, targetId]) => {
+    const config = bandCanvasPrintConfigs.get(sourceId);
+    if (!config || !$(targetId)) return;
+    const legendOptions = sourceId === "intervalChart"
+      ? {}
+      : { hideCanvasLegend: false, legendPosition: "top" };
+    renderBandCanvas(targetId, config.series, { ...config.options, ...chartSize, ...legendOptions });
+  });
+
+  if (exposurePrintConfig && $("printExposureChart")) {
+    renderCanvasFallbackFor(
+      "printExposureChart",
+      exposurePrintConfig.datasets,
+      exposurePrintConfig.minX,
+      exposurePrintConfig.maxX,
+      exposurePrintConfig.yAxisLabel,
+      { ...chartSize, xAxisLabel: exposurePrintConfig.xAxisLabel, hideLegend: false },
+    );
+  }
+  if (switchPrintConfig && $("printSwitchChart")) {
+    renderCanvasFallbackFor(
+      "printSwitchChart",
+      switchPrintConfig.datasets,
+      switchPrintConfig.minX,
+      switchPrintConfig.maxX,
+      switchPrintConfig.yAxisLabel,
+      { ...chartSize, xAxisLabel: switchPrintConfig.xAxisLabel, hideLegend: false },
+    );
+  }
+}
+
+function renderPrintReport({ includeCharts = false } = {}) {
+  if (!$("printReportSummary")) return;
+  const shareUrl = $("shareUrl")?.value || buildShareUrl();
+  const qrMarkup = $("shareQr")?.innerHTML || "";
+  const scenario = iggScenarioPresets[state.calibration.mode] || iggScenarioPresets.replacement;
+  const reportDate = formatReportDate();
+  $("printReportSummary").innerHTML = `
+    <section class="print-page print-overview-page">
+      <header class="print-report-heading">
+        <div>
+          <p class="print-kicker">Schedule comparison report</p>
+          <h1>SCIG Schedule Simulator</h1>
+          <p class="print-subtitle">Modeled IgG patterns, relative exposure, infusion burden, and an extended dose interval.</p>
+        </div>
+        <div class="print-date"><span>Generated</span><strong>${reportDate}</strong></div>
+      </header>
+      <div class="print-report-grid">
+        <div><span>Patient profile</span><strong>${escapeHtml(scenario.label)}</strong><small>${formatNumber(state.calibration.bodyWeightKg, 0)} kg model patient</small></div>
+        <div><span>Product</span><strong>${escapeHtml(state.product.name)}</strong><small>${formatNumber(state.product.concentrationGPerMl, 2)} g/mL · ${escapeHtml(state.product.cartridgeInventoryText || "no cartridges")}</small></div>
+        <div><span>Reference dose</span><strong>${formatDose(state.dosing.weeklyDoseG)} / ${formatNumber(state.dosing.weeklyDoseMl, 1)} mL</strong><small>${formatNumber(state.dosing.exactProtocolDoseGKgWeek, 3)} g/kg/week after product rounding</small></div>
+        <div><span>Model horizon</span><strong>${formatNumber(state.params.simulationHorizonDays, 0)} days</strong><small>Absorption ${formatNumber(state.params.absorptionHalfTimeDays, 1)} d · elimination ${formatNumber(state.params.eliminationHalfLifeDays, 0)} d</small></div>
+      </div>
+      <div class="print-section-heading">
+        <div><span>Schedules</span><h2>Reference and comparators</h2></div>
+        <p>Each comparator is evaluated against the reference schedule.</p>
+      </div>
+      <table class="print-schedule-table">
+        <thead><tr><th>Schedule</th><th>Cycle</th><th>Dose per cycle</th><th>Dose events</th></tr></thead>
+        <tbody>${printRegimenRows()}</tbody>
+      </table>
+      <div class="print-assumption-strip">
+        <div><span>IgG baseline</span><strong>${formatMgDl(state.calibration.baselinePreScigIggMgDl)}</strong></div>
+        <div><span>Lab orientation range</span><strong>${formatMgDl(state.calibration.labReferenceLowMgDl)}–${formatMgDl(state.calibration.labReferenceHighMgDl)}</strong></div>
+        <div><span>High-value warning</span><strong>${formatMgDl(state.calibration.highIggWarningThresholdMgDl)}</strong></div>
+      </div>
+      <aside class="print-disclaimer"><strong>Comparative model only.</strong> This report is not an individualized IgG prediction or dose recommendation. Model profiles, reference lines, and uncertainty bands are editable assumptions.</aside>
+      ${printPageFooter("Overview")}
+    </section>
+
+    <section class="print-page print-results-page">
+      <div class="print-section-heading print-page-heading">
+        <div><span>Results</span><h2>Schedule metrics</h2></div>
+        <p>Feasibility, infusion burden, and normalized model outputs.</p>
+      </div>
+      <div class="print-results-table">${$("resultsTable")?.innerHTML || ""}</div>
+      ${printPageFooter("Results")}
+    </section>
+
+    <section class="print-page print-chart-page">
+      <div class="print-section-heading print-page-heading">
+        <div><span>Estimated IgG</span><h2>Modeled IgG bands</h2></div>
+        <p>Shaded regions reflect the editable uncertainty range.</p>
+      </div>
+      <figure class="print-figure">
+        <figcaption><strong>Estimated IgG bands by schedule</strong><span>Final 42 days of each schedule.</span></figcaption>
+        <canvas id="printAmplitudeBandChart" role="img" aria-label="Printable estimated IgG bands by schedule"></canvas>
+      </figure>
+      <figure class="print-figure">
+        <figcaption><strong>Estimated IgG bands after switch</strong><span>Reference schedule before day 0, then each comparator begins.</span></figcaption>
+        <canvas id="printAmplitudeSwitchChart" role="img" aria-label="Printable estimated IgG bands after switching"></canvas>
+      </figure>
+      <p class="print-chart-note">Dotted lines are the selected lab reference range for orientation; vertical markers are modeled dose events.</p>
+      ${printPageFooter("Estimated IgG")}
+    </section>
+
+    <section class="print-page print-chart-page">
+      <div class="print-section-heading print-page-heading">
+        <div><span>Relative exposure</span><h2>Normalized schedule comparisons</h2></div>
+        <p>Values are relative to the reference average, not measured serum concentrations.</p>
+      </div>
+      <figure class="print-figure">
+        <figcaption><strong>Relative exposure across the simulation</strong><span>Includes model ramp-up from the zero-start assumption.</span></figcaption>
+        <canvas id="printExposureChart" role="img" aria-label="Printable relative exposure graph"></canvas>
+      </figure>
+      <figure class="print-figure">
+        <figcaption><strong>Relative exposure after switch</strong><span>Continue the reference or switch to ${escapeHtml(switchComparator().name)} at day 0.</span></figcaption>
+        <canvas id="printSwitchChart" role="img" aria-label="Printable relative exposure after switch graph"></canvas>
+      </figure>
+      ${printPageFooter("Relative exposure")}
+    </section>
+
+    <section class="print-page print-interval-page">
+      <div class="print-section-heading print-page-heading">
+        <div><span>Extended interval</span><h2>Tail after the final dose</h2></div>
+        <p>Models a completed dose followed by no subsequent doses.</p>
+      </div>
+      <div class="print-interval-summary">${$("intervalSummary")?.innerHTML || ""}</div>
+      <figure class="print-figure print-interval-figure">
+        <figcaption><strong>${escapeHtml(intervalRegimen().name)}</strong><span>${$("intervalContext")?.innerHTML || ""}</span></figcaption>
+        <canvas id="printIntervalChart" role="img" aria-label="Printable extended interval graph"></canvas>
+      </figure>
+      <div class="print-interval-details">
+        <div><h3>Threshold crossings</h3>${$("intervalCrossings")?.innerHTML || ""}</div>
+        <div><h3>Common checkpoints</h3>${$("intervalCheckpoints")?.innerHTML || ""}</div>
+      </div>
+      <div class="print-share-card">
+        <div class="print-report-qr">${qrMarkup}</div>
+        <div><span>Reopen this setup</span><strong>Scan the QR code or use the embedded PDF link.</strong><a href="${escapeHtml(shareUrl)}">Open this simulator setup</a></div>
+      </div>
+      <p class="print-chart-note">The curve approaches the editable pre-SCIG baseline rather than zero. Pair the model with observed symptoms and measured labs.</p>
+      ${printPageFooter("Extended interval")}
+    </section>
+  `;
+  if (includeCharts) renderPrintCharts();
+}
+
+function preparePrintReport() {
+  intervalExplorerActive = true;
+  renderExtendedInterval();
+  renderSharePanel({ forceQr: true });
+  renderPrintReport({ includeCharts: true });
+  if (originalDocumentTitle === null) originalDocumentTitle = document.title;
+  document.title = `SCIG Schedule Simulator - ${formatExportDate()}`;
+}
+
+function finishPrintReport() {
+  if (originalDocumentTitle !== null) {
+    document.title = originalDocumentTitle;
+    originalDocumentTitle = null;
+  }
+}
+
 function renderResults(referenceMetrics, comparatorSims) {
-  const active = comparatorSims.find((sim) => sim.regimen.id === state.activeComparatorId) || comparatorSims[0];
-  renderResultsDashboard(referenceMetrics, active.metrics);
-  renderCompareBar(referenceMetrics, active.metrics);
-  renderDeltaNarratives(referenceMetrics, active.metrics);
-  $("interpretation").innerHTML = generateInterpretation(referenceMetrics, active.metrics);
   $("resultsTable").className = "results-table";
   $("resultsTable").innerHTML = metricTable(referenceMetrics, comparatorSims);
-}
-
-function renderDeltaNarratives(reference, candidate) {
-  const refAmp = labAnchoredAmplitudeSummary(state.reference);
-  const candAmp = labAnchoredAmplitudeSummary(activeComparator());
-  const refSwing = refAmp.valid ? midpoint(refAmp.amplitude) : null;
-  const candSwing = candAmp.valid ? midpoint(candAmp.amplitude) : null;
-  const narratives = [
-    comparisonSentence("Estimated swing", refSwing, candSwing, "mg/dL", "wider", "narrower"),
-    comparisonSentence("Longest gap", reference.longestGapDays, candidate.longestGapDays, "days", "longer", "shorter"),
-    comparisonSentence("Dose intensity", 100, candidate.percentReferenceDoseIntensity, "% of reference", "higher", "lower"),
-    comparisonSentence("Per-site volume", reference.maxMlPerSite, candidate.maxMlPerSite, "mL/site", "higher", "lower"),
-    comparisonSentence("Infusion time", reference.maxInfusionMinutes, candidate.maxInfusionMinutes, "minutes", "longer", "shorter"),
-  ];
-  $("deltaNarratives").innerHTML = narratives.map((item) => `
-    <div class="narrative-card">
-      <span>${escapeHtml(item.label)}</span>
-      <p>${escapeHtml(item.text)}</p>
-    </div>
-  `).join("");
-}
-
-function comparisonSentence(label, reference, candidate, unit, higherWord, lowerWord) {
-  if (!Number.isFinite(reference) || !Number.isFinite(candidate)) {
-    return { label, text: `${label} is not estimated with the current settings.` };
-  }
-  const delta = candidate - reference;
-  if (Math.abs(delta) < 0.05) {
-    return { label, text: `${label} is about the same as the reference.` };
-  }
-  const direction = delta > 0 ? higherWord : lowerWord;
-  const digits = unit === "minutes" ? 0 : 1;
-  const unitLabel = unit === "minutes" ? "min" : unit;
-  return {
-    label,
-    text: `${label} is ${direction}: ${formatNumber(candidate, digits)} ${unitLabel} vs ${formatNumber(reference, digits)} ${unitLabel} for reference.`,
-  };
 }
 
 function renderAssumptionAudit() {
@@ -1289,68 +2033,23 @@ function renderAssumptionAudit() {
 }
 
 function renderChartMode() {
+  const availableModes = new Set(Array.from(document.querySelectorAll("[data-chart-mode]")).map((button) => button.dataset.chartMode));
+  if (!availableModes.has(state.chartMode)) state.chartMode = "igg";
   document.querySelectorAll("[data-chart-mode]").forEach((button) => {
-    button.classList.toggle("active", button.dataset.chartMode === state.chartMode);
+    const active = button.dataset.chartMode === state.chartMode;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
   });
   document.querySelectorAll("[data-chart-panel]").forEach((panel) => {
-    panel.classList.toggle("hidden", panel.dataset.chartPanel !== state.chartMode);
+    const active = panel.dataset.chartPanel === state.chartMode;
+    panel.classList.toggle("hidden", !active);
+    panel.setAttribute("aria-hidden", String(!active));
   });
   window.setTimeout(() => {
     if (exposureChart) exposureChart.resize();
     if (switchChart) switchChart.resize();
   }, 0);
-}
-
-function renderResultsDashboard(reference, candidate) {
-  const referenceAmp = labAnchoredAmplitudeSummary(state.reference);
-  const candidateAmp = labAnchoredAmplitudeSummary(activeComparator());
-  const refSwing = referenceAmp.valid ? midpoint(referenceAmp.amplitude) : null;
-  const candSwing = candidateAmp.valid ? midpoint(candidateAmp.amplitude) : null;
-  $("resultsDashboard").innerHTML = [
-    dashboardTile("Peak-trough swing", formatDeltaValue(refSwing, candSwing, "mg/dL"), neutralDeltaLabel(refSwing, candSwing, "wider", "narrower")),
-    dashboardTile("Lowest estimated IgG", candidateAmp.valid ? formatRange(candidateAmp.trough.min, candidateAmp.trough.max, formatInteger) : "n/a", "selected comparator band"),
-    dashboardTile("Longest gap", `${formatNumber(candidate.longestGapDays, 1)} days`, neutralDeltaLabel(reference.longestGapDays, candidate.longestGapDays, "longer", "shorter")),
-    dashboardTile("Dose intensity", formatPercent(candidate.percentReferenceDoseIntensity, 1), neutralDeltaLabel(100, candidate.percentReferenceDoseIntensity, "higher", "lower")),
-    dashboardTile("Infusion days / 28 days", formatNumber(candidate.infusionDaysPer28Days, 1), neutralDeltaLabel(reference.infusionDaysPer28Days, candidate.infusionDaysPer28Days, "more", "fewer")),
-    dashboardTile("Max mL/site", `${formatNumber(candidate.maxMlPerSite, 1)} mL`, neutralDeltaLabel(reference.maxMlPerSite, candidate.maxMlPerSite, "higher", "lower")),
-    dashboardTile("Estimated infusion time", formatMinutes(candidate.maxInfusionMinutes), neutralDeltaLabel(reference.maxInfusionMinutes, candidate.maxInfusionMinutes, "longer", "shorter")),
-  ].join("");
-}
-
-function dashboardTile(label, value, note) {
-  return `
-    <div class="dashboard-tile">
-      <span>${escapeHtml(label)}</span>
-      <strong>${escapeHtml(value)}</strong>
-      <small>${escapeHtml(note)}</small>
-    </div>
-  `;
-}
-
-function midpoint(range) {
-  return Number.isFinite(range?.min) && Number.isFinite(range?.max) ? (range.min + range.max) / 2 : null;
-}
-
-function formatDeltaValue(reference, candidate, unit) {
-  if (!Number.isFinite(reference) || !Number.isFinite(candidate)) return "n/a";
-  return `${formatNumber(candidate, 0)} ${unit}`;
-}
-
-function neutralDeltaLabel(reference, candidate, higherWord, lowerWord) {
-  if (!Number.isFinite(reference) || !Number.isFinite(candidate)) return "not estimated";
-  const delta = candidate - reference;
-  if (Math.abs(delta) < 0.05) return "about the same as reference";
-  return `${delta > 0 ? higherWord : lowerWord} than reference`;
-}
-
-function renderCompareBar(reference, candidate) {
-  $("compareBar").innerHTML = `
-    <div><span>Reference</span><strong>${escapeHtml(reference.name)}</strong></div>
-    <div><span>Comparator</span><strong>${escapeHtml(candidate.name)}</strong></div>
-    <div><span>Dose intensity</span><strong>${formatPercent(candidate.percentReferenceDoseIntensity, 1)}</strong></div>
-    <div><span>Longest gap</span><strong>${formatNumber(candidate.longestGapDays, 1)} days</strong></div>
-    <div><span>Max mL/site</span><strong>${formatNumber(candidate.maxMlPerSite, 1)} mL</strong></div>
-  `;
 }
 
 function referenceDoseGPerKgPerWeek() {
@@ -1370,7 +2069,6 @@ function expectedTroughMgDl(scenario = state.calibration) {
 }
 
 function expectedPeakMgDl(scenario = state.calibration) {
-  if (scenario.mode === "custom") return scenario.customCalibrationIggMgDl;
   return expectedTroughMgDl(scenario) * scenario.peakToTroughRatio;
 }
 
@@ -1461,10 +2159,10 @@ function renderAmplitudeEstimate(comparatorSims) {
     </div>
   `;
   renderAmplitudeBandChart([
-    { label: "Reference", regimen: state.reference },
-    ...comparatorSims.map((sim, index) => ({ label: `Comparator ${index + 1}`, regimen: sim.regimen })),
+    { label: `Reference: ${state.reference.name}`, regimen: state.reference },
+    ...comparatorSims.map((sim, index) => ({ label: `Comparator ${index + 1}: ${sim.regimen.name}`, regimen: sim.regimen })),
   ]);
-  renderAmplitudeSwitchBandChart();
+  renderAmplitudeSwitchBandChart(comparatorSims);
 }
 
 function amplitudeRow(row) {
@@ -1490,6 +2188,7 @@ function amplitudeRow(row) {
 }
 
 function labAnchoredAmplitudeSummary(regimen) {
+  if (amplitudeSummaryCache.has(regimen)) return amplitudeSummaryCache.get(regimen);
   const samples = calibrationScenarios().map((scenario) => {
     const scale = scenarioScale(scenario);
     if (!Number.isFinite(scale)) return null;
@@ -1509,7 +2208,9 @@ function labAnchoredAmplitudeSummary(regimen) {
     };
   }).filter(Boolean);
 
-  return summarizeSampleObjects(samples, ["average", "peak", "trough", "amplitude", "amplitudePercent"]);
+  const summary = summarizeSampleObjects(samples, ["average", "peak", "trough", "amplitude", "amplitudePercent"]);
+  amplitudeSummaryCache.set(regimen, summary);
+  return summary;
 }
 
 function labAnchoredWaningSummary(referenceRegimen) {
@@ -1560,36 +2261,43 @@ function renderAmplitudeBandChart(rows) {
   const startDay = Math.max(0, state.params.simulationHorizonDays - 42);
   const series = rows.map((row, index) => ({
     label: row.label,
-    color: ["#4d2d96", "#0f8b8d", "#b95f89", "#3266a8", "#7a6f21"][index % 5],
+    color: amplitudeSeriesColors[index % amplitudeSeriesColors.length],
     bands: labAnchoredRegimenBand(row.regimen, startDay, state.params.simulationHorizonDays, startDay),
     markers: regimenDoseMarkers(row.regimen, startDay, state.params.simulationHorizonDays, startDay),
   })).filter((row) => row.bands.length);
+
+  $("amplitudeBandSeriesLegend").innerHTML = series.map((item) => `
+    <span><b style="--series-color: ${item.color}"></b>${escapeHtml(item.label)}</span>
+  `).join("");
 
   renderBandCanvas("amplitudeBandChart", series, {
     xLabel: "Days within final 42-day window",
     yLabel: "Estimated IgG (mg/dL)",
     minX: 0,
     maxX: state.params.simulationHorizonDays - startDay,
+    hideCanvasLegend: true,
   });
 }
 
-function renderAmplitudeSwitchBandChart() {
-  const comparator = switchComparator();
+function renderAmplitudeSwitchBandChart(comparatorSims) {
   const horizon = state.params.switchHorizonDays;
-  const series = [
-    {
-      label: `Switch: ${comparator.name}`,
-      color: "#0f8b8d",
-      bands: labAnchoredSwitchBand(comparator, horizon),
-      markers: regimenDoseMarkers(comparator, 0, horizon, 0),
-    },
-  ].filter((row) => row.bands.length);
+  const series = comparatorSims.map((sim, index) => ({
+    label: `Comparator ${index + 1}: ${sim.regimen.name}`,
+    color: amplitudeSeriesColors[(index + 1) % amplitudeSeriesColors.length],
+    bands: labAnchoredSwitchBand(sim.regimen, horizon),
+    markers: regimenDoseMarkers(sim.regimen, 0, horizon, 0),
+  })).filter((row) => row.bands.length);
+
+  $("amplitudeSwitchSeriesLegend").innerHTML = series.map((item) => `
+    <span><b style="--series-color: ${item.color}"></b>${escapeHtml(item.label)}</span>
+  `).join("");
 
   renderBandCanvas("amplitudeSwitchChart", series, {
     xLabel: "Days after switch",
     yLabel: "Estimated IgG (mg/dL)",
     minX: 0,
     maxX: horizon,
+    hideCanvasLegend: true,
   });
 }
 
@@ -1651,6 +2359,230 @@ function labAnchoredSwitchBand(comparator, horizon) {
     .sort((a, b) => a.x - b.x);
 }
 
+function regimenAnchoredAtLastDose(regimen) {
+  const firstEventDay = Math.min(...regimen.events.map((event) => Number(event.day)));
+  return {
+    ...regimen,
+    events: regimen.events.map((event) => ({ ...event, day: Number(event.day) - firstEventDay })),
+  };
+}
+
+function intervalCalibrationScenarios() {
+  return calibrationScenarios();
+}
+
+function intervalScenarioCurves(regimen, horizonDays) {
+  const anchored = regimenAnchoredAtLastDose(regimen);
+  return intervalCalibrationScenarios().map((scenario) => {
+    const scale = scenarioScale(scenario);
+    if (!Number.isFinite(scale)) return null;
+    const ka = Math.log(2) / scenario.absorptionHalfTimeDays;
+    const ke = Math.log(2) / scenario.eliminationHalfLifeDays;
+    const preconditionDays = Math.max(
+      210,
+      scenario.eliminationHalfLifeDays * 6,
+      Number(anchored.cycleLengthDays) * 10,
+    );
+    const completedDoseHistory = expandRelativeEvents(
+      anchored,
+      -preconditionDays,
+      0,
+      state.product.concentrationGPerMl,
+    );
+    const points = simulateRawFromAbsoluteEvents(
+      completedDoseHistory,
+      horizonDays,
+      state.params.timestepDays,
+      ka,
+      ke,
+    ).map((point) => ({
+      day: point.day,
+      value: scenario.baselinePreScigIggMgDl + scale * point.exposure,
+    }));
+    return { scenario, points };
+  }).filter(Boolean);
+}
+
+function intervalBandFromCurves(curves) {
+  if (!curves.length) return [];
+  return curves[0].points.map((point, index) => {
+    const values = curves.map((curve) => curve.points[index].value).filter(Number.isFinite);
+    return {
+      x: point.day,
+      min: Math.min(...values),
+      max: Math.max(...values),
+      mid: values.reduce((sum, value) => sum + value, 0) / values.length,
+    };
+  });
+}
+
+function firstWaningCrossing(points, threshold) {
+  if (!points.length || !Number.isFinite(threshold)) return { kind: "unavailable", day: null };
+  let peakIndex = 0;
+  for (let index = 1; index < points.length; index += 1) {
+    if (points[index].value > points[peakIndex].value) peakIndex = index;
+  }
+  if (points[peakIndex].value < threshold) return { kind: "never-above", day: null };
+  for (let index = peakIndex + 1; index < points.length; index += 1) {
+    const previous = points[index - 1];
+    const current = points[index];
+    if (previous.value >= threshold && current.value < threshold) {
+      const fraction = (previous.value - threshold) / Math.max(previous.value - current.value, 1e-9);
+      return { kind: "crosses", day: previous.day + fraction * (current.day - previous.day) };
+    }
+  }
+  return { kind: "after-horizon", day: null };
+}
+
+function intervalCrossingSummary(curves, threshold, horizonDays) {
+  const results = curves.map((curve) => firstWaningCrossing(curve.points, threshold));
+  const crossingDays = results.filter((result) => result.kind === "crosses").map((result) => result.day);
+  const neverAboveCount = results.filter((result) => result.kind === "never-above").length;
+  const afterHorizonCount = results.filter((result) => result.kind === "after-horizon").length;
+  if (!crossingDays.length && neverAboveCount === results.length) {
+    return { display: "Not above", note: "Below this threshold throughout the post-dose view" };
+  }
+  if (!crossingDays.length && afterHorizonCount === results.length) {
+    return { display: `After day ${formatNumber(horizonDays, 0)}`, note: "Still above at the end of this view" };
+  }
+  if (!crossingDays.length) {
+    return { display: "Model-dependent", note: "Assumptions disagree on whether a crossing occurs" };
+  }
+  const range = minMax(crossingDays);
+  const display = Math.abs(range.max - range.min) < 0.5
+    ? `Day ${formatNumber((range.min + range.max) / 2, 0)}`
+    : `Day ${formatNumber(range.min, 0)}-${formatNumber(range.max, 0)}`;
+  const exceptions = [];
+  if (neverAboveCount) exceptions.push(`${neverAboveCount} never above`);
+  if (afterHorizonCount) exceptions.push(`${afterHorizonCount} remain above`);
+  return {
+    display,
+    note: exceptions.length
+      ? `${crossingDays.length}/${results.length} assumptions cross; ${exceptions.join(", ")}`
+      : "Earliest-latest across uncertainty assumptions",
+  };
+}
+
+function intervalBandAtDay(band, day) {
+  return band.reduce((closest, point) => (
+    Math.abs(point.x - day) < Math.abs(closest.x - day) ? point : closest
+  ), band[0]);
+}
+
+function nextScheduledDoseDay(regimen) {
+  const anchored = regimenAnchoredAtLastDose(regimen);
+  const events = expandRelativeEvents(
+    anchored,
+    state.params.timestepDays,
+    Math.max(Number(anchored.cycleLengthDays) * 2, 2),
+    state.product.concentrationGPerMl,
+  );
+  return events.length ? events[0].absoluteDay : Number(anchored.cycleLengthDays);
+}
+
+function renderExtendedInterval() {
+  const regimen = intervalRegimen();
+  const horizonDays = Math.max(30, Number(state.interval.horizonDays));
+  const checkpointDay = Math.min(horizonDays, Math.max(0, Number(state.interval.checkpointDay)));
+  const curves = intervalScenarioCurves(regimen, horizonDays);
+  const band = intervalBandFromCurves(curves);
+  if (!band.length) {
+    $("intervalSummary").innerHTML = '<div class="summary-tile"><strong>Unable to model this interval</strong></div>';
+    $("intervalCrossings").innerHTML = "";
+    $("intervalCheckpoints").innerHTML = "";
+    return;
+  }
+
+  const checkpoint = intervalBandAtDay(band, checkpointDay);
+  const peakPoints = curves.map((curve) => curve.points.reduce((peak, point) => point.value > peak.value ? point : peak, curve.points[0]));
+  const peakValues = minMax(peakPoints.map((point) => point.value));
+  const peakDays = minMax(peakPoints.map((point) => point.day));
+  const endogenousFloor = minMax(curves.map((curve) => curve.scenario.baselinePreScigIggMgDl));
+  const nextDoseDay = nextScheduledDoseDay(regimen);
+  const delayDays = checkpointDay - nextDoseDay;
+
+  $("intervalSummary").innerHTML = `
+    <div class="summary-tile featured">
+      <span>Still no dose on day ${formatNumber(checkpointDay, 0)}</span>
+      <strong>${formatRange(checkpoint.min, checkpoint.max, formatInteger)} mg/dL</strong>
+    </div>
+    <div class="summary-tile">
+      <span>Post-dose peak</span>
+      <strong>${formatRange(peakValues.min, peakValues.max, formatInteger)} mg/dL</strong>
+      <small>around day ${formatRange(peakDays.min, peakDays.max, (value) => formatNumber(value, 0))}</small>
+    </div>
+    <div class="summary-tile">
+      <span>Endogenous floor</span>
+      <strong>${formatRange(endogenousFloor.min, endogenousFloor.max, formatInteger)} mg/dL</strong>
+      <small>the tail approaches this band, not zero</small>
+    </div>
+  `;
+
+  $("intervalContext").innerHTML = `
+    The usual next event is around <strong>day ${formatNumber(nextDoseDay, 1)}</strong>.
+    Day ${formatNumber(checkpointDay, 0)} is ${delayDays >= 0
+      ? `<strong>${formatNumber(delayDays, 1)} days beyond</strong> that event`
+      : `<strong>${formatNumber(Math.abs(delayDays), 1)} days before</strong> that event`}.
+    The chart assumes every subsequent event remains withheld.
+  `;
+
+  document.querySelectorAll("[data-interval-day]").forEach((button) => {
+    const selected = Number(button.dataset.intervalDay) === Number(state.interval.checkpointDay);
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-pressed", selected ? "true" : "false");
+  });
+
+  const thresholds = [
+    { label: "High-value warning", value: Number(state.calibration.highIggWarningThresholdMgDl) },
+    { label: "Tracking high", value: Number(state.interval.upperThresholdMgDl) },
+    { label: "Tracking low", value: Number(state.interval.lowerThresholdMgDl) },
+  ];
+  $("intervalCrossings").innerHTML = `
+    <table class="interval-table">
+      <thead><tr><th>Threshold</th><th>Downward crossing</th></tr></thead>
+      <tbody>${thresholds.map((threshold) => {
+        const summary = intervalCrossingSummary(curves, threshold.value, horizonDays);
+        return `<tr>
+          <td><strong>${escapeHtml(threshold.label)}</strong><small>${formatMgDl(threshold.value)}</small></td>
+          <td><strong>${summary.display}</strong><small>${escapeHtml(summary.note)}</small></td>
+        </tr>`;
+      }).join("")}</tbody>
+    </table>
+  `;
+
+  const checkpointDays = [7, 14, 21, 28].filter((day) => day <= horizonDays);
+  $("intervalCheckpoints").innerHTML = `
+    <table class="interval-table">
+      <thead><tr><th>Still holding at</th><th>Modeled band</th></tr></thead>
+      <tbody>${checkpointDays.map((day) => {
+        const point = intervalBandAtDay(band, day);
+        return `<tr class="${day === checkpointDay ? "selected" : ""}">
+          <td><strong>Day ${day}</strong><small>${day >= nextDoseDay ? `${formatNumber(day - nextDoseDay, 1)} days past usual event` : "before usual event"}</small></td>
+          <td><strong>${formatRange(point.min, point.max, formatInteger)} mg/dL</strong><small>uncertainty band</small></td>
+        </tr>`;
+      }).join("")}</tbody>
+    </table>
+  `;
+
+  renderBandCanvas("intervalChart", [{
+    label: "No subsequent doses",
+    color: "#0f7f82",
+    bands: band,
+    markers: [{ x: 0, label: "last dose" }],
+  }], {
+    xLabel: "Days since the final dose",
+    yLabel: "Estimated IgG (mg/dL)",
+    minX: 0,
+    maxX: horizonDays,
+    checkpointDay,
+    zeroBaseline: false,
+    referenceLines: [
+      { value: Number(state.interval.upperThresholdMgDl), label: "tracking high", color: "#b4692f" },
+      { value: Number(state.interval.lowerThresholdMgDl), label: "tracking low", color: "#3266a8" },
+    ],
+  });
+}
+
 function regimenDoseMarkers(regimen, startDay, endDay, xOffset) {
   const markers = [];
   const cycleLength = Math.max(Number(regimen.cycleLengthDays), 0.1);
@@ -1674,20 +2606,22 @@ function regimenDoseMarkers(regimen, startDay, endDay, xOffset) {
 function renderBandCanvas(canvasId, series, options) {
   const targetCanvas = $(canvasId);
   if (!targetCanvas) return;
+  if (!canvasId.startsWith("print")) bandCanvasPrintConfigs.set(canvasId, { series, options });
   const rect = targetCanvas.getBoundingClientRect();
-  const width = Math.max(280, Math.floor(rect.width || targetCanvas.clientWidth || 700));
-  const height = Math.max(320, Math.floor(rect.height || targetCanvas.clientHeight || 360));
+  const width = Math.max(280, Math.floor(options.renderWidth || rect.width || targetCanvas.clientWidth || 700));
+  const height = Math.max(320, Math.floor(options.renderHeight || rect.height || targetCanvas.clientHeight || 360));
   const ratio = window.devicePixelRatio || 1;
   targetCanvas.width = width * ratio;
   targetCanvas.height = height * ratio;
-  targetCanvas.style.width = `${width}px`;
-  targetCanvas.style.height = `${height}px`;
+  targetCanvas.style.width = canvasId.startsWith("print") ? "100%" : `${width}px`;
+  targetCanvas.style.height = canvasId.startsWith("print") ? "auto" : `${height}px`;
 
   const ctx = targetCanvas.getContext("2d");
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.clearRect(0, 0, width, height);
 
-  const margin = { top: 24, right: 24, bottom: 58, left: 64 };
+  const topLegend = options.legendPosition === "top" && !options.hideCanvasLegend;
+  const margin = { top: topLegend ? 54 : 24, right: 24, bottom: 58, left: 64 };
   const plotWidth = width - margin.left - margin.right;
   const plotHeight = height - margin.top - margin.bottom;
   const allValues = series.flatMap((item) => item.bands.flatMap((point) => [point.min, point.max]));
@@ -1698,10 +2632,16 @@ function renderBandCanvas(canvasId, series, options) {
     return;
   }
 
-  const rawMinY = Math.min(...allValues);
-  const rawMaxY = Math.max(...allValues);
+  const visibleReferenceValues = (options.referenceLines || [])
+    .map((line) => Number(line.value))
+    .filter(Number.isFinite);
+  const scaleValues = [...allValues, ...visibleReferenceValues];
+  const rawMinY = Math.min(...scaleValues);
+  const rawMaxY = Math.max(...scaleValues);
   const padY = Math.max(50, (rawMaxY - rawMinY) * 0.12);
-  const minY = 0;
+  const minY = options.zeroBaseline === false
+    ? Math.max(0, Math.floor((rawMinY - padY) / 100) * 100)
+    : 0;
   const maxY = Math.ceil((rawMaxY + padY) / 100) * 100;
   const xScale = (x) => margin.left + ((x - options.minX) / Math.max(1, options.maxX - options.minX)) * plotWidth;
   const yScale = (y) => margin.top + (1 - (y - minY) / Math.max(1, maxY - minY)) * plotHeight;
@@ -1732,7 +2672,18 @@ function renderBandCanvas(canvasId, series, options) {
     ctx.fillText(formatNumber(yValue, 0), margin.left - 8, y);
   }
 
-  drawNormalRangeLines(ctx, yScale, margin, plotWidth, minY, maxY);
+  drawReferenceLines(
+    ctx,
+    yScale,
+    margin,
+    plotWidth,
+    minY,
+    maxY,
+    options.referenceLines || [
+      { value: state.calibration.labReferenceLowMgDl, label: "lab ref low" },
+      { value: state.calibration.labReferenceHighMgDl, label: "lab ref high" },
+    ],
+  );
 
   ctx.textAlign = "center";
   ctx.textBaseline = "top";
@@ -1746,7 +2697,13 @@ function renderBandCanvas(canvasId, series, options) {
     drawDoseMarkers(ctx, item.markers, item.color, xScale, margin.top, plotHeight);
   });
 
-  drawLegend(ctx, series, margin.left, height - 22);
+  if (Number.isFinite(options.checkpointDay)) {
+    drawCheckpointLine(ctx, options.checkpointDay, xScale, margin.top, plotHeight);
+  }
+
+  if (!options.hideCanvasLegend) {
+    drawLegend(ctx, series, margin.left, topLegend ? 18 : height - 22, width - margin.left - margin.right);
+  }
 
   ctx.save();
   ctx.translate(18, margin.top + plotHeight / 2);
@@ -1760,17 +2717,12 @@ function renderBandCanvas(canvasId, series, options) {
   ctx.fillText(options.xLabel, margin.left + plotWidth / 2, height - 6);
 }
 
-function drawNormalRangeLines(ctx, yScale, margin, plotWidth, minY, maxY) {
-  const low = Math.min(state.calibration.labReferenceLowMgDl, state.calibration.labReferenceHighMgDl);
-  const high = Math.max(state.calibration.labReferenceLowMgDl, state.calibration.labReferenceHighMgDl);
-  [
-    { value: low, label: "lab ref low" },
-    { value: high, label: "lab ref high" },
-  ].forEach((line) => {
+function drawReferenceLines(ctx, yScale, margin, plotWidth, minY, maxY, lines) {
+  lines.forEach((line) => {
     if (!Number.isFinite(line.value) || line.value < minY || line.value > maxY) return;
     const y = yScale(line.value);
     ctx.save();
-    ctx.strokeStyle = "#8d8798";
+    ctx.strokeStyle = line.color || "#8d8798";
     ctx.lineWidth = 1.2;
     ctx.setLineDash([2, 5]);
     ctx.beginPath();
@@ -1779,12 +2731,31 @@ function drawNormalRangeLines(ctx, yScale, margin, plotWidth, minY, maxY) {
     ctx.stroke();
     ctx.restore();
 
-    ctx.fillStyle = "#675f74";
+    ctx.fillStyle = line.color || "#675f74";
     ctx.font = "11px system-ui, sans-serif";
     ctx.textAlign = "left";
     ctx.textBaseline = "bottom";
     ctx.fillText(`${line.label} ${formatNumber(line.value, 0)}`, margin.left + 6, y - 3);
   });
+}
+
+function drawCheckpointLine(ctx, day, xScale, top, plotHeight) {
+  const x = xScale(day);
+  ctx.save();
+  ctx.strokeStyle = "#164f51";
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([6, 5]);
+  ctx.beginPath();
+  ctx.moveTo(x, top);
+  ctx.lineTo(x, top + plotHeight);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "#164f51";
+  ctx.font = "11px system-ui, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.fillText(`day ${formatNumber(day, 0)}`, x, top + 5);
+  ctx.restore();
 }
 
 function drawBand(ctx, points, color, xScale, yScale) {
@@ -1833,36 +2804,57 @@ function drawDoseMarkers(ctx, markers, color, xScale, top, plotHeight) {
   ctx.restore();
 }
 
-function drawLegend(ctx, series, x, y) {
+function drawLegend(ctx, series, x, y, maxWidth = Infinity) {
   let legendX = x;
+  let legendY = y;
+  ctx.font = "700 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
   ctx.textAlign = "left";
   ctx.textBaseline = "middle";
   series.forEach((item) => {
+    const itemWidth = 46 + ctx.measureText(item.label).width;
+    if (legendX + itemWidth > x + maxWidth && legendX > x) {
+      legendX = x;
+      legendY += 19;
+    }
     ctx.strokeStyle = item.color;
     ctx.lineWidth = 3;
     ctx.beginPath();
-    ctx.moveTo(legendX, y);
-    ctx.lineTo(legendX + 22, y);
+    ctx.moveTo(legendX, legendY);
+    ctx.lineTo(legendX + 22, legendY);
     ctx.stroke();
     ctx.fillStyle = "#211a2e";
-    ctx.fillText(item.label.slice(0, 24), legendX + 28, y);
-    legendX += Math.min(190, 48 + item.label.length * 7);
+    ctx.fillText(item.label, legendX + 28, legendY);
+    legendX += itemWidth + 14;
   });
 }
 
 function scenarioCalibrationPeakMgDl(scenario) {
-  if (state.calibration.mode === "custom") return scenario.customCalibrationIggMgDl;
   return expectedTroughMgDl(scenario) * scenario.peakToTroughRatio;
 }
 
 function scenarioScale(scenario) {
+  const cacheKey = [
+    scenario.baselinePreScigIggMgDl,
+    scenario.doseSlopeMgDlPer01GKgWeek,
+    scenario.absorptionHalfTimeDays,
+    scenario.eliminationHalfLifeDays,
+    scenario.peakToTroughRatio,
+    state.calibration.mode,
+  ].map((value) => String(value)).join("|");
+  if (scenarioScaleCache.has(cacheKey)) return scenarioScaleCache.get(cacheKey);
+
   const treatmentDerived = scenarioCalibrationPeakMgDl(scenario) - scenario.baselinePreScigIggMgDl;
-  if (treatmentDerived <= 0) return null;
+  if (treatmentDerived <= 0) {
+    scenarioScaleCache.set(cacheKey, null);
+    return null;
+  }
   const scenarioParams = { ...state.params, absorptionHalfTimeDays: scenario.absorptionHalfTimeDays, eliminationHalfLifeDays: scenario.eliminationHalfLifeDays };
   const referenceRaw = simulateRegimen(state.reference, scenarioParams, state.product);
   const calibrationDay = calibrationAbsoluteDay(state.reference, state.calibration.tmaxDaysAfterWeeklyInfusion);
   const exposureAtLab = valueAtDay(referenceRaw.points, calibrationDay);
-  return exposureAtLab > 0 ? treatmentDerived / exposureAtLab : null;
+  const scale = exposureAtLab > 0 ? treatmentDerived / exposureAtLab : null;
+  scenarioScaleCache.set(cacheKey, scale);
+  return scale;
 }
 
 function calibrationAbsoluteDay(regimen, daysAfterInfusion) {
@@ -1877,6 +2869,7 @@ function firstReferenceEventDay(regimen) {
 }
 
 function calibrationScenarios() {
+  if (calibrationScenarioCache) return calibrationScenarioCache;
   const baselineCenter = Number(state.calibration.baselinePreScigIggMgDl);
   const baselineSpread = Math.max(0, Number(state.calibration.baselineUncertaintyMgDl));
   const baselineLow = Math.max(0, baselineCenter - baselineSpread);
@@ -1888,10 +2881,10 @@ function calibrationScenarios() {
   const eliminationLow = Math.min(state.calibration.eliminationHalfLifeLowDays, state.calibration.eliminationHalfLifeHighDays);
   const eliminationHigh = Math.max(state.calibration.eliminationHalfLifeLowDays, state.calibration.eliminationHalfLifeHighDays);
 
-  const baselines = uniqueSortedNumbers([baselineLow, (baselineLow + baselineHigh) / 2, baselineHigh]);
-  const slopes = uniqueSortedNumbers([Math.max(0, slopeCenter - slopeSpread), slopeCenter, slopeCenter + slopeSpread]);
-  const absorptionValues = uniqueSortedNumbers([absorptionLow, state.params.absorptionHalfTimeDays, absorptionHigh].filter((value) => value > 0));
-  const eliminationValues = uniqueSortedNumbers([eliminationLow, state.params.eliminationHalfLifeDays, eliminationHigh].filter((value) => value > 0));
+  const baselines = uniqueSortedNumbers([baselineLow, baselineHigh]);
+  const slopes = uniqueSortedNumbers([Math.max(0, slopeCenter - slopeSpread), slopeCenter + slopeSpread]);
+  const absorptionValues = uniqueSortedNumbers([absorptionLow, absorptionHigh].filter((value) => value > 0));
+  const eliminationValues = uniqueSortedNumbers([eliminationLow, eliminationHigh].filter((value) => value > 0));
   const scenarios = [];
 
   baselines.forEach((baselinePreScigIggMgDl) => {
@@ -1910,7 +2903,26 @@ function calibrationScenarios() {
     });
   });
 
-  return scenarios;
+  scenarios.push({
+    ...state.calibration,
+    baselinePreScigIggMgDl: baselineCenter,
+    doseSlopeMgDlPer01GKgWeek: slopeCenter,
+    absorptionHalfTimeDays: Number(state.params.absorptionHalfTimeDays),
+    eliminationHalfLifeDays: Number(state.params.eliminationHalfLifeDays),
+  });
+
+  const unique = new Map();
+  scenarios.forEach((scenario) => {
+    const key = [
+      scenario.baselinePreScigIggMgDl,
+      scenario.doseSlopeMgDlPer01GKgWeek,
+      scenario.absorptionHalfTimeDays,
+      scenario.eliminationHalfLifeDays,
+    ].map((value) => Number(value).toFixed(4)).join("|");
+    unique.set(key, scenario);
+  });
+  calibrationScenarioCache = [...unique.values()];
+  return calibrationScenarioCache;
 }
 
 function summarizeSampleObjects(samples, keys) {
@@ -1940,11 +2952,9 @@ function formatRange(min, max, formatter) {
 
 function metricTable(referenceMetrics, comparatorSims) {
   const metrics = [
-    ["Cycle length (days)", (m) => formatNumber(m.cycleLengthDays, 1)],
+    ["Cycle length (days)", (m) => formatNumber(m.cycleLengthDays, 0)],
     ["Total volume per cycle (mL)", (m) => formatNumber(m.totalMlPerCycle, 0)],
     ["Total dose per cycle (g)", (m) => formatNumber(m.totalGPerCycle, 1)],
-    ["Volume per day (mL/day)", (m) => formatNumber(m.mlPerDay, 1)],
-    ["Dose per day (g/day)", (m) => formatNumber(m.gPerDay, 2)],
     ["Weekly volume equivalent (mL/week)", (m) => formatNumber(m.mlPerWeek, 1)],
     ["Weekly dose equivalent (g/week)", (m) => formatNumber(m.gPerWeek, 1)],
     ["Dose intensity vs reference (%)", (m) => formatNumber(m.percentReferenceDoseIntensity, 2)],
@@ -1957,15 +2967,15 @@ function metricTable(referenceMetrics, comparatorSims) {
     ["Max sites per infusion day", (m) => formatNumber(m.maxSitesPerInfusionDay, 0)],
     ["Max volume per site (mL/site)", (m) => formatNumber(m.maxMlPerSite, 1)],
     ["Average volume per site (mL/site)", (m) => formatNumber(m.averageMlPerSite, 1)],
-    ["Longest gap (days)", (m) => formatNumber(m.longestGapDays, 1)],
-    ["Max estimated infusion time", (m) => formatMinutes(m.maxInfusionMinutes)],
-    ["Cartridge feasibility", (m) => m.cartridgeFeasible ? "Matches available cartridges" : "Needs unavailable cartridge mix"],
+    ["Estimated infusion time", (m) => formatInfusionTimeCell(m)],
+    ["Cartridge feasibility", (m) => m.cartridgeFeasible
+      ? '<span class="metric-status metric-status-ok" aria-label="Matches available cartridges" title="Matches available cartridges">✓</span>'
+      : '<span class="metric-status metric-status-warning" aria-label="Needs unavailable cartridge mix" title="Needs unavailable cartridge mix">!</span>'],
     ["Normalized average exposure (%)", (m) => formatNumber(m.normalizedAverageExposure, 1)],
     ["Normalized peak exposure (%)", (m) => formatNumber(m.normalizedPeakExposure, 1)],
     ["Normalized trough exposure (%)", (m) => formatNumber(m.normalizedTroughExposure, 1)],
     ["Peak-trough range (percentage points)", (m) => formatNumber(m.peakTroughRange, 1)],
     ["Coefficient of variation (%)", (m) => formatNumber(m.coefficientOfVariation * 100, 1)],
-    ["Final-window drift check", (m) => m.driftFraction > 0.05 ? "Still drifting" : "Near repeating pattern"],
   ];
 
   const columns = [referenceMetrics, ...comparatorSims.map((sim) => sim.metrics)];
@@ -1979,27 +2989,40 @@ function metricTable(referenceMetrics, comparatorSims) {
         </tr>
       </thead>
       <tbody>
-        ${metrics.map(([label, formatter]) => `
-          <tr>
+        ${metrics.map(([label, formatter, rowClass = ""]) => `
+          <tr class="${rowClass}">
             <td>${label}</td>
             ${columns.map((column) => `<td>${formatter(column)}</td>`).join("")}
           </tr>
         `).join("")}
-        <tr>
-          <td>Infusion time detail</td>
-          ${columns.map((column) => `<td>${formatInfusionDetails(column.infusionTimes)}</td>`).join("")}
-        </tr>
       </tbody>
     </table>
   `;
 }
 
-function formatInfusionDetails(times) {
-  return times.map((time) => {
-    const runs = time.runs.map((run) => `${formatNumber(run.volumeMl, 0)} mL (${formatMinutes(run.hours * 60)})`).join(" + ");
-    const feasibility = time.feasible ? "" : " - unavailable cartridge mix";
-    return `Day ${formatNumber(time.day, 0)}: ${formatMinutes(time.minutes)} (${runs})${feasibility}`;
-  }).join("<br>");
+function formatInfusionTimeCell(metrics) {
+  const maxMinutes = Math.round(Number(metrics.maxInfusionMinutes));
+  const maxDay = metrics.infusionTimes.find((time) => Math.round(Number(time.hours) * 60) === maxMinutes)
+    || metrics.infusionTimes[0];
+  const breakdown = maxDay ? formatInfusionMinuteBreakdown(maxDay) : "";
+  const feasibility = maxDay && !maxDay.feasible
+    ? '<small class="infusion-time-warning">Unavailable cartridge mix</small>'
+    : "";
+  return `
+    <span class="infusion-time-cell">
+      <strong>${formatMinutes(metrics.maxInfusionMinutes)}</strong>
+      ${breakdown ? `<small>(${breakdown})</small>` : ""}
+      ${feasibility}
+    </span>
+  `;
+}
+
+function formatInfusionMinuteBreakdown(time) {
+  const minuteParts = time.runs
+    .map((run) => Math.round(Number(run.hours) * 60))
+    .filter((minutes) => Number.isFinite(minutes) && minutes >= 0);
+  if (!minuteParts.length) return "";
+  return `${minuteParts.join("+")} min`;
 }
 
 function formatMinutes(minutes) {
@@ -2009,38 +3032,6 @@ function formatMinutes(minutes) {
   const mins = rounded % 60;
   if (hours === 0) return `${mins} min`;
   return `${hours} hr ${mins} min`;
-}
-
-function generateInterpretation(reference, candidate) {
-  const intensityDelta = Math.abs(candidate.percentReferenceDoseIntensity - 100);
-  const cards = [
-    {
-      label: "Dose intensity",
-      text: intensityDelta > 5
-        ? `This schedule provides ${formatNumber(candidate.mlPerWeek, 1)} mL/week, or ${formatPercent(candidate.percentReferenceDoseIntensity, 2)} of the reference dose intensity.`
-        : `This schedule keeps average dose intensity close to reference; differences mainly reflect timing and split pattern.`,
-    },
-    {
-      label: "Burden",
-      text: `Sites per 14 days change from ${formatNumber(reference.sitesPer14Days, 2)} to ${formatNumber(candidate.sitesPer14Days, 2)}, with max per-site volume ${formatNumber(reference.maxMlPerSite, 1)} to ${formatNumber(candidate.maxMlPerSite, 1)} mL/site.`,
-    },
-    {
-      label: "Infusion time",
-      text: `Estimated max infusion-day time changes from ${formatMinutes(reference.maxInfusionMinutes)} to ${formatMinutes(candidate.maxInfusionMinutes)} using ${state.product.tubing} and selected cartridge counts.`,
-    },
-  ];
-  if (!candidate.cartridgeFeasible) {
-    cards.push({
-      label: "Cartridge check",
-      text: "This active candidate cannot be exactly assembled from the available cartridge selection.",
-    });
-  }
-  return `<div class="interpretation-grid">${cards.map((card) => `
-    <div class="interpretation-card">
-      <span>${escapeHtml(card.label)}</span>
-      <p>${escapeHtml(card.text)}</p>
-    </div>
-  `).join("")}</div>`;
 }
 
 function renderChart(referenceSim, comparatorSims) {
@@ -2062,6 +3053,13 @@ function renderChart(referenceSim, comparatorSims) {
       pointRadius: 0,
     })),
   ];
+  exposurePrintConfig = {
+    datasets,
+    minX: chartMinDay(referenceSim),
+    maxX: referenceSim.points.at(-1).day,
+    xAxisLabel: "Simulation day",
+    yAxisLabel: "Relative exposure (% of reference average)",
+  };
 
   if (typeof Chart === "undefined") {
     renderCanvasFallback(datasets, referenceSim);
@@ -2129,6 +3127,13 @@ function renderSwitchScenario(referenceSteadyAverage) {
       pointRadius: 0,
     },
   ];
+  switchPrintConfig = {
+    datasets,
+    minX: 0,
+    maxX: state.params.switchHorizonDays,
+    xAxisLabel: "Days after switch",
+    yAxisLabel: "Relative exposure (% of reference average)",
+  };
 
   renderSwitchSummary(simulation.switchComparator.points, comparator.name);
 
@@ -2198,109 +3203,6 @@ function valueAtDay(points, day) {
   ), points[0]).exposure;
 }
 
-function renderAnalysis(referenceSim, comparatorSims, referenceSteadyAverage) {
-  const zeroStartRows = [
-    {
-      label: "Reference",
-      name: state.reference.name,
-      points: referenceSim.points,
-    },
-    ...comparatorSims.map((sim, index) => ({
-      label: `Comparator ${index + 1}`,
-      name: sim.regimen.name,
-      points: sim.normalized.points,
-    })),
-  ].map((row) => {
-    const finalStats = computeSteadyWindowStats({ points: row.points }, state.params.steadyWindowDays);
-    const target = finalStats.average * 0.95;
-    return {
-      ...row,
-      finalAverage: finalStats.average,
-      rampDay: firstDaySustainedAtOrAbove(row.points, target),
-    };
-  });
-
-  const selectedComparator = switchComparator();
-  const switchSim = simulateSwitchScenario(state.reference, selectedComparator, state.params, state.product, referenceSteadyAverage);
-  const comparatorRaw = simulateRegimen(selectedComparator, state.params, state.product);
-  const comparatorNormalized = normalizeSimulation(comparatorRaw, referenceSteadyAverage);
-  const comparatorFinalStats = computeSteadyWindowStats(comparatorNormalized, state.params.steadyWindowDays);
-  const switchSettleDay = firstDaySustainedWithinFraction(
-    switchSim.switchComparator.points,
-    comparatorFinalStats.average,
-    0.05,
-  );
-
-  $("analysisSummary").innerHTML = `
-    <div class="analysis-block">
-      <h3>Zero-start ramp-up</h3>
-      <p>Time until the curve first reaches and remains above 95% of that regimen's own final-28-day average within this simulation horizon.</p>
-      <table class="analysis-table">
-        <thead>
-          <tr>
-            <th>Regimen</th>
-            <th>Final-window average</th>
-            <th>Ramp-up time</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${zeroStartRows.map((row) => `
-            <tr>
-              <td>${escapeHtml(row.label)}: ${escapeHtml(row.name)}</td>
-              <td>${formatPercent(row.finalAverage, 1)}</td>
-              <td>${formatAnalysisDay(row.rampDay)}</td>
-            </tr>
-          `).join("")}
-        </tbody>
-      </table>
-    </div>
-    <div class="analysis-block">
-      <h3>Switch settling</h3>
-      <p>Assumes reference preconditioning for ${formatNumber(state.params.switchPreconditionDays, 0)} days, then switches to the selected comparator. Settling means the switch curve enters and remains within 5% of the comparator's expected final-28-day average.</p>
-      <table class="analysis-table">
-        <thead>
-          <tr>
-            <th>Switch target</th>
-            <th>Expected comparator average</th>
-            <th>Time to settle after switch</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td>${escapeHtml(selectedComparator.name)}</td>
-            <td>${formatPercent(comparatorFinalStats.average, 1)}</td>
-            <td>${formatAnalysisDay(switchSettleDay)}</td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-  `;
-}
-
-function firstDaySustainedAtOrAbove(points, target) {
-  for (let index = 0; index < points.length; index += 1) {
-    if (points[index].exposure >= target && points.slice(index).every((point) => point.exposure >= target)) {
-      return points[index].day;
-    }
-  }
-  return null;
-}
-
-function firstDaySustainedWithinFraction(points, target, fraction) {
-  const tolerance = Math.abs(target) * fraction;
-  for (let index = 0; index < points.length; index += 1) {
-    if (Math.abs(points[index].exposure - target) <= tolerance
-      && points.slice(index).every((point) => Math.abs(point.exposure - target) <= tolerance)) {
-      return points[index].day;
-    }
-  }
-  return null;
-}
-
-function formatAnalysisDay(day) {
-  return day === null ? "Not reached in horizon" : `Day ${formatNumber(day, 0)}`;
-}
-
 function renderCanvasFallback(datasets, referenceSim) {
   renderCanvasFallbackFor(
     "exposureChart",
@@ -2311,16 +3213,16 @@ function renderCanvasFallback(datasets, referenceSim) {
   );
 }
 
-function renderCanvasFallbackFor(canvasId, datasets, minX, maxX, yAxisLabel) {
+function renderCanvasFallbackFor(canvasId, datasets, minX, maxX, yAxisLabel, renderOptions = {}) {
   const targetCanvas = $(canvasId);
   const rect = targetCanvas.getBoundingClientRect();
-  const width = Math.max(280, Math.floor(rect.width || targetCanvas.clientWidth || 900));
-  const height = Math.max(340, Math.floor(rect.height || targetCanvas.clientHeight || 420));
+  const width = Math.max(280, Math.floor(renderOptions.renderWidth || rect.width || targetCanvas.clientWidth || 900));
+  const height = Math.max(340, Math.floor(renderOptions.renderHeight || rect.height || targetCanvas.clientHeight || 420));
   const ratio = window.devicePixelRatio || 1;
   targetCanvas.width = width * ratio;
   targetCanvas.height = height * ratio;
-  targetCanvas.style.width = `${width}px`;
-  targetCanvas.style.height = `${height}px`;
+  targetCanvas.style.width = canvasId.startsWith("print") ? "100%" : `${width}px`;
+  targetCanvas.style.height = canvasId.startsWith("print") ? "auto" : `${height}px`;
 
   const ctx = targetCanvas.getContext("2d");
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
@@ -2381,21 +3283,24 @@ function renderCanvasFallbackFor(canvasId, datasets, minX, maxX, yAxisLabel) {
     ctx.stroke();
   });
 
-  let legendX = margin.left;
-  const legendY = height - 24;
-  ctx.textAlign = "left";
-  ctx.textBaseline = "middle";
-  datasets.forEach((dataset) => {
-    ctx.strokeStyle = dataset.borderColor;
-    ctx.lineWidth = 3;
-    ctx.beginPath();
-    ctx.moveTo(legendX, legendY);
-    ctx.lineTo(legendX + 24, legendY);
-    ctx.stroke();
-    ctx.fillStyle = "#211a2e";
-    ctx.fillText(dataset.label.slice(0, 36), legendX + 30, legendY);
-    legendX += Math.min(280, 36 + dataset.label.length * 7);
-  });
+  if (!renderOptions.hideLegend) {
+    let legendX = margin.left;
+    const legendY = height - 24;
+    ctx.font = "700 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    datasets.forEach((dataset) => {
+      ctx.strokeStyle = dataset.borderColor;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(legendX, legendY);
+      ctx.lineTo(legendX + 24, legendY);
+      ctx.stroke();
+      ctx.fillStyle = "#211a2e";
+      ctx.fillText(dataset.label, legendX + 30, legendY);
+      legendX += 48 + ctx.measureText(dataset.label).width;
+    });
+  }
 
   ctx.save();
   ctx.translate(18, margin.top + plotHeight / 2);
@@ -2405,7 +3310,7 @@ function renderCanvasFallbackFor(canvasId, datasets, minX, maxX, yAxisLabel) {
   ctx.fillText(yAxisLabel, 0, 0);
   ctx.restore();
   ctx.textAlign = "center";
-  ctx.fillText("Simulation day", margin.left + plotWidth / 2, height - 6);
+  ctx.fillText(renderOptions.xAxisLabel || "Simulation day", margin.left + plotWidth / 2, height - 6);
 }
 
 function chartPoints(simulation) {
@@ -2461,18 +3366,69 @@ function timelineRow(label, regimen) {
   `;
 }
 
+function scheduleSimulationFromInput() {
+  if (simulationInputTimer) window.clearTimeout(simulationInputTimer);
+  simulationInputTimer = window.setTimeout(() => {
+    simulationInputTimer = null;
+    runSimulation();
+  }, 280);
+}
+
+function cancelScheduledSimulation() {
+  if (!simulationInputTimer) return;
+  window.clearTimeout(simulationInputTimer);
+  simulationInputTimer = null;
+}
+
 function bindEvents() {
   document.addEventListener("input", (event) => {
     const target = event.target;
+    if (target.matches('input[type="number"]')) {
+      const invalid = target.value !== "" && (target.validity.badInput || target.validity.rangeUnderflow || target.validity.rangeOverflow);
+      if (invalid) target.setAttribute("aria-invalid", "true");
+      else target.removeAttribute("aria-invalid");
+      if (invalid) return;
+    }
     if (target.matches("[data-comparator-id][data-comparator-field]")) {
       const comparator = comparatorById(target.dataset.comparatorId);
       if (comparator) comparator[target.dataset.comparatorField] = target.value;
+    } else if (target.matches("[data-type][data-field]")) {
+      updateRegimenFromInput(target, { commit: false });
+    } else if (target.matches("[data-cartridge-volume]")) {
+      state.product.cartridgeSelectionMode = "manual";
+      scheduleSimulationFromInput();
+    } else if (target.matches("input")) {
+      if (["productName", "concentration"].includes(target.id)) {
+        $("productPreset").value = "custom";
+      }
+      if (["bodyWeightKg", "protocolDoseGKgWeek", "totalDoseMl", "totalDoseG", "concentration"].includes(target.id)) {
+        state.product.cartridgeSelectionMode = "auto";
+      }
+      scheduleSimulationFromInput();
+    }
+  });
+
+  document.addEventListener("change", (event) => {
+    const target = event.target;
+    cancelScheduledSimulation();
+    if (target.matches("[data-comparator-id][data-comparator-field]")) {
+      const comparator = comparatorById(target.dataset.comparatorId);
+      if (comparator) comparator[target.dataset.comparatorField] = target.value.trim() || "Untitled comparator";
+      runSimulation();
     } else if (target.matches("[data-type][data-field]")) {
       updateRegimenFromInput(target);
       runSimulation();
     } else if (target.matches("[data-cartridge-volume]")) {
       state.product.cartridgeSelectionMode = "manual";
       runSimulation();
+    } else if (target.id === "iggScenarioMode") {
+      applyIggScenarioPreset(target.value);
+      runSimulation();
+    } else if (target.id === "productPreset") {
+      applyProductPreset(target.value);
+      runSimulation();
+    } else if (["referencePreset", "candidatePreset", "switchComparator"].includes(target.id)) {
+      return;
     } else if (target.matches("input, select")) {
       if (["productName", "concentration"].includes(target.id)) {
         $("productPreset").value = "custom";
@@ -2481,26 +3437,39 @@ function bindEvents() {
         state.product.cartridgeSelectionMode = "auto";
       }
       runSimulation();
-    }
-  });
-
-  document.addEventListener("change", (event) => {
-    const target = event.target;
-    if (target.matches("[data-comparator-id][data-comparator-field]")) {
-      const comparator = comparatorById(target.dataset.comparatorId);
-      if (comparator) comparator[target.dataset.comparatorField] = target.value.trim() || "Untitled comparator";
-      runSimulation();
-    } else if (target.id === "iggScenarioMode") {
-      applyIggScenarioPreset(target.value);
-      runSimulation();
-    } else if (target.id === "productPreset") {
-      applyProductPreset(target.value);
-      runSimulation();
+      if (target.matches('input[type="number"]')) {
+        syncFormControlsFromState();
+        target.removeAttribute("aria-invalid");
+      }
     }
   });
 
   document.addEventListener("click", (event) => {
     const target = event.target;
+    const sectionLink = target.closest?.('.section-nav a[href^="#"]');
+    if (sectionLink) {
+      const sectionId = sectionLink.getAttribute("href").slice(1);
+      if (navigateToSection(sectionId)) event.preventDefault();
+      if (sectionId === "intervalExplorer") {
+        intervalExplorerActive = true;
+        renderExtendedInterval();
+      }
+      return;
+    }
+    if (target.matches(".help-tip")) {
+      const shouldOpen = !target.classList.contains("is-open");
+      document.querySelectorAll(".help-tip.is-open").forEach((tip) => {
+        tip.classList.remove("is-open");
+        tip.setAttribute("aria-expanded", "false");
+      });
+      target.classList.toggle("is-open", shouldOpen);
+      target.setAttribute("aria-expanded", String(shouldOpen));
+      return;
+    }
+    document.querySelectorAll(".help-tip.is-open").forEach((tip) => {
+      tip.classList.remove("is-open");
+      tip.setAttribute("aria-expanded", "false");
+    });
     if (target.dataset.action === "add-event") {
       addEvent(target.dataset.type);
       runSimulation();
@@ -2510,6 +3479,7 @@ function bindEvents() {
       runSimulation();
     }
     if (target.dataset.action === "select-comparator") {
+      editingComparatorId = target.dataset.comparatorId;
       state.activeComparatorId = target.dataset.comparatorId;
       runSimulation();
     }
@@ -2537,10 +3507,42 @@ function bindEvents() {
       state.product.cartridgeSelectionMode = "auto";
       runSimulation();
     }
+    if (target.dataset.intervalDay) {
+      state.interval.checkpointDay = Number(target.dataset.intervalDay);
+      renderExtendedInterval();
+      renderSharePanel();
+      renderPrintReport();
+    }
     if (target.dataset.chartMode) {
       state.chartMode = target.dataset.chartMode;
       renderChartMode();
+      renderSharePanel();
+      renderPrintReport();
     }
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.target.matches?.("[data-chart-mode]") && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+      const tabs = Array.from(document.querySelectorAll("[data-chart-mode]"));
+      const currentIndex = tabs.indexOf(event.target);
+      const nextIndex = event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? tabs.length - 1
+          : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+      event.preventDefault();
+      state.chartMode = tabs[nextIndex].dataset.chartMode;
+      tabs[nextIndex].focus();
+      renderChartMode();
+      renderSharePanel();
+      renderPrintReport();
+      return;
+    }
+    if (event.key !== "Escape") return;
+    document.querySelectorAll(".help-tip.is-open").forEach((tip) => {
+      tip.classList.remove("is-open");
+      tip.setAttribute("aria-expanded", "false");
+    });
   });
 
   $("autoCartridges").addEventListener("click", () => {
@@ -2549,27 +3551,46 @@ function bindEvents() {
   });
 
   $("referencePreset").addEventListener("change", (event) => {
-    const preset = presets.find((item) => item.id === event.target.value);
+    pendingReferencePresetId = event.target.value;
+    renderGeneratedPresetControls();
+  });
+
+  $("applyReferencePreset").addEventListener("click", () => {
+    const preset = presets.find((item) => item.id === pendingReferencePresetId);
     if (!preset) return;
     state.reference = clonePreset(preset);
-    event.target.value = "";
+    editedRegimens.add(state.reference);
+    pendingReferencePresetId = "";
     runSimulation();
   });
 
   $("candidatePreset").addEventListener("change", (event) => {
-    const preset = presets.find((item) => item.id === event.target.value);
+    pendingComparatorPresetId = event.target.value;
+    renderGeneratedPresetControls();
+  });
+
+  $("applyCandidatePreset").addEventListener("click", () => {
+    const preset = presets.find((item) => item.id === pendingComparatorPresetId);
     if (!preset) return;
-    const comparator = activeComparator();
+    const comparator = editingComparator() || activeComparator();
     Object.assign(comparator, clonePreset(preset), { id: comparator.id });
-    event.target.value = "";
+    editedRegimens.add(comparator);
+    pendingComparatorPresetId = "";
     runSimulation();
   });
 
   $("addComparator").addEventListener("click", () => {
     const next = createComparatorFromPreset(presets[4]);
     state.comparators.push(next);
+    editingComparatorId = next.id;
     state.activeComparatorId = next.id;
     state.switchComparatorId = next.id;
+    runSimulation();
+  });
+
+  $("closeComparatorEditor").addEventListener("click", () => {
+    editingComparatorId = null;
+    pendingComparatorPresetId = "";
     runSimulation();
   });
 
@@ -2577,13 +3598,63 @@ function bindEvents() {
     state.switchComparatorId = event.target.value;
     runSimulation();
   });
+
+  $("copyShareLink").addEventListener("click", async () => {
+    const shareUrl = $("shareUrl").value || buildShareUrl();
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(shareUrl);
+      } else {
+        $("shareUrl").select();
+        document.execCommand("copy");
+      }
+      $("shareStatus").textContent = "Share link copied.";
+    } catch (error) {
+      $("shareStatus").textContent = "Copy failed. Select and copy the share link manually.";
+    }
+  });
+
+  $("printReport").addEventListener("click", () => {
+    preparePrintReport();
+    window.print();
+  });
+
+  document.querySelector(".share-panel")?.addEventListener("toggle", (event) => {
+    if (!event.currentTarget.open) return;
+    renderSharePanel({ forceQr: true });
+    renderPrintReport();
+  });
+}
+
+function observeIntervalExplorer() {
+  if (!("IntersectionObserver" in window) || !$("intervalExplorer")) return;
+  const observer = new window.IntersectionObserver((entries) => {
+    if (!entries.some((entry) => entry.isIntersecting)) return;
+    intervalExplorerActive = true;
+    renderExtendedInterval();
+    observer.disconnect();
+  }, { rootMargin: "240px 0px" });
+  observer.observe($("intervalExplorer"));
 }
 
 function init() {
-  renderPresetSelect($("referencePreset"));
-  renderPresetSelect($("candidatePreset"));
+  const shareToken = readShareTokenFromUrl();
+  if (shareToken) {
+    try {
+      applySimulatorState(decodeSharePayload(shareToken));
+      syncFormControlsFromState();
+    } catch (error) {
+      console.warn("Unable to load shared simulator state", error);
+    }
+  }
+  intervalExplorerActive = currentSectionFromUrl() === "intervalExplorer";
   bindEvents();
+  window.addEventListener("beforeprint", preparePrintReport);
+  window.addEventListener("afterprint", finishPrintReport);
   runSimulation();
+  const initialSection = currentSectionFromUrl();
+  document.getElementById(initialSection)?.scrollIntoView?.({ block: "start" });
+  if (!intervalExplorerActive) observeIntervalExplorer();
 }
 
 window.addEventListener("DOMContentLoaded", init);

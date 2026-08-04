@@ -8,6 +8,7 @@ const code = fs.readFileSync("script.js", "utf8");
 const context = {
   console,
   structuredClone,
+  Buffer,
   window: { addEventListener() {} },
 };
 
@@ -24,12 +25,20 @@ globalThis.__testApi = {
   simulateRegimen,
   computeSteadyWindowStats,
   simulateSwitchScenario,
+  intervalScenarioCurves,
+  intervalBandFromCurves,
+  firstWaningCrossing,
   parseCartridgeInventory,
   cloneInventory,
   allocateCartridges,
   estimateInfusionTime,
   formatMinutes,
   productPresets,
+  state,
+  serializeSimulatorState,
+  encodeSharePayload,
+  decodeSharePayload,
+  applySimulatorState,
 };`, context);
 
 const {
@@ -43,15 +52,23 @@ const {
   simulateRegimen,
   computeSteadyWindowStats,
   simulateSwitchScenario,
+  intervalScenarioCurves,
+  intervalBandFromCurves,
+  firstWaningCrossing,
   parseCartridgeInventory,
   cloneInventory,
   allocateCartridges,
   estimateInfusionTime,
   formatMinutes,
   productPresets,
+  state,
+  serializeSimulatorState,
+  encodeSharePayload,
+  decodeSharePayload,
+  applySimulatorState,
 } = context.__testApi;
 
-const sameArray = (actual, expected) => assert.deepEqual(JSON.parse(JSON.stringify(actual)), expected);
+const sameArray = (actual, expected) => assert.deepEqual(JSON.parse(JSON.stringify(actual)), JSON.parse(JSON.stringify(expected)));
 
 const product = {
   tubing: "F2400",
@@ -245,3 +262,144 @@ console.log("product dose rounding tests passed");
 }
 
 console.log("switch scenario tests passed");
+
+{
+  const reference = presets[0];
+  const curves = intervalScenarioCurves(reference, 180);
+  const band = intervalBandFromCurves(curves);
+  const centerCurve = curves.find((curve) => (
+    curve.scenario.baselinePreScigIggMgDl === state.calibration.baselinePreScigIggMgDl
+    && curve.scenario.absorptionHalfTimeDays === state.params.absorptionHalfTimeDays
+    && curve.scenario.eliminationHalfLifeDays === state.params.eliminationHalfLifeDays
+  ));
+
+  assert.ok(curves.length >= 2, "extended interval should include uncertainty scenarios");
+  assert.ok(band.length > 100, "extended interval should follow the full tail");
+  assert.ok(centerCurve, "extended interval should retain the center scenario");
+  const initial = centerCurve.points[0].value;
+  const final = centerCurve.points.at(-1).value;
+  const baseline = centerCurve.scenario.baselinePreScigIggMgDl;
+  assert.ok(final >= baseline, "held-dose curve should not fall below the endogenous baseline");
+  assert.ok(final - baseline < initial - baseline, "treatment contribution should wane after doses stop");
+  assert.ok(band.find((point) => point.x === 14).mid > band.find((point) => point.x === 30).mid);
+
+  const crossing = firstWaningCrossing([
+    { day: 0, value: 100 },
+    { day: 1, value: 120 },
+    { day: 2, value: 110 },
+    { day: 3, value: 90 },
+  ], 100);
+  assert.equal(crossing.kind, "crosses");
+  approx(crossing.day, 2.5, 0.001);
+}
+
+console.log("extended interval tests passed");
+
+{
+  state.product.presetId = "cuvitru";
+  state.product.name = "Cuvitru 20%";
+  state.product.concentrationGPerMl = 0.2;
+  state.product.tubing = "F1200";
+  state.product.cartridgeSelectionMode = "manual";
+  state.product.cartridgeInventory = inventoryFromCounts({ 50: 2, 20: 1, 10: 0, 5: 0 });
+  state.product.referenceRunMinutes = 52;
+  state.dosing.entryMode = "total";
+  state.dosing.totalDoseUnit = "mL";
+  state.dosing.totalDoseMl = 120;
+  state.dosing.totalDoseG = 24;
+  state.params.absorptionHalfTimeDays = 1.8;
+  state.params.eliminationHalfLifeDays = 28;
+  state.params.simulationHorizonDays = 365;
+  state.params.switchPreconditionDays = 168;
+  state.calibration.mode = "neurologic";
+  state.calibration.bodyWeightKg = 72;
+  state.reference = {
+    id: "q7",
+    presetId: "custom",
+    name: "Custom reference",
+    cycleLengthDays: 10,
+    events: [
+      { day: 0, volumeMl: 80, sites: 4 },
+      { day: 5, volumeMl: 40, sites: 2 },
+    ],
+  };
+  state.comparators = [
+    {
+      id: "comp-custom",
+      presetId: "custom",
+      name: "Custom comparator",
+      cycleLengthDays: 14,
+      events: [{ day: 0, volumeMl: 120, sites: 5 }],
+    },
+  ];
+  state.activeComparatorId = "comp-custom";
+  state.switchComparatorId = "comp-custom";
+  state.chartWindow = "90";
+  state.chartMode = "switch";
+  state.interval.regimenId = "comp-custom";
+  state.interval.horizonDays = 120;
+  state.interval.checkpointDay = 28;
+  state.interval.upperThresholdMgDl = 1900;
+  state.interval.lowerThresholdMgDl = 1100;
+
+  const payload = serializeSimulatorState();
+  const token = encodeSharePayload(payload);
+  assert.ok(token.length > 100);
+  sameArray(decodeSharePayload(token), payload);
+
+  state.product.name = "Changed product";
+  state.product.cartridgeSelectionMode = "auto";
+  state.dosing.entryMode = "protocol";
+  state.reference.name = "Changed reference";
+  state.comparators = [];
+  assert.equal(applySimulatorState(decodeSharePayload(token)), true);
+
+  assert.equal(state.product.name, "Cuvitru 20%");
+  assert.equal(state.product.cartridgeSelectionMode, "manual");
+  assert.equal(state.product.referenceRunMinutes, 52);
+  assert.equal(state.dosing.entryMode, "total");
+  assert.equal(state.params.simulationHorizonDays, 365);
+  assert.equal(state.calibration.bodyWeightKg, 72);
+  assert.equal(state.reference.name, "Custom reference");
+  assert.equal(state.reference.events.length, 2);
+  assert.equal(state.comparators[0].name, "Custom comparator");
+  assert.equal(state.activeComparatorId, "comp-1", "shared comparator IDs should be regenerated");
+  assert.equal(state.chartMode, "switch");
+  assert.equal(state.interval.regimenId, "comp-1", "interval selection should follow the regenerated comparator ID");
+  assert.equal(state.interval.horizonDays, 120);
+  assert.equal(state.interval.checkpointDay, 28);
+  assert.equal(state.interval.upperThresholdMgDl, 1900);
+  assert.equal(state.interval.lowerThresholdMgDl, 1100);
+  assert.equal(selectedCartridgeVolume(state.product.cartridgeInventory), 120);
+
+  const hostilePayload = structuredClone(payload);
+  hostilePayload.m.h = 1000000000;
+  hostilePayload.m.ts = 0.000001;
+  hostilePayload.g.w = 1000000;
+  hostilePayload.r.n = '<img id="unsafe-shared-markup" src=x>';
+  hostilePayload.cs = Array.from({ length: 20 }, (_item, index) => ({
+    i: `\" onmouseover=\"unsafe-${index}`,
+    p: "custom",
+    n: `Comparator ${index}`,
+    c: 1000000,
+    e: Array.from({ length: 30 }, () => [-20, 1000000, 100]),
+  }));
+  hostilePayload.a = hostilePayload.cs[3].i;
+  hostilePayload.sw = hostilePayload.cs[4].i;
+  hostilePayload.x.r = hostilePayload.cs[2].i;
+  assert.equal(applySimulatorState(hostilePayload), true);
+  assert.equal(state.params.simulationHorizonDays, 365, "unknown simulation horizons should fall back to a safe allowed value");
+  assert.equal(state.params.timestepDays, 0.25, "unknown timesteps should fall back to a safe allowed value");
+  assert.equal(state.calibration.bodyWeightKg, 300, "shared numeric inputs should be bounded");
+  assert.equal(state.comparators.length, 4, "shared comparator count should be bounded");
+  assert.deepEqual(state.comparators.map((comparator) => comparator.id), ["comp-1", "comp-2", "comp-3", "comp-4"]);
+  assert.ok(state.comparators.every((comparator) => comparator.events.length === 6), "shared event counts should be bounded");
+  assert.ok(state.comparators.every((comparator) => comparator.cycleLengthDays === 365));
+  assert.ok(state.comparators.every((comparator) => comparator.events.every((event) => event.day >= 0 && event.day < 365 && event.volumeMl <= 5000 && event.sites <= 8)));
+  assert.equal(state.activeComparatorId, "comp-4");
+  assert.equal(state.switchComparatorId, "comp-1", "a selection beyond the comparator limit should fall back safely");
+  assert.equal(state.interval.regimenId, "comp-3");
+  assert.throws(() => decodeSharePayload("a".repeat(24001)), /too large/);
+}
+
+console.log("share state round-trip tests passed");

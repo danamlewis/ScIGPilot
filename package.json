@@ -1,0 +1,16 @@
+{
+  "name": "scig-schedule-simulator",
+  "version": "0.1.0",
+  "license": "MIT",
+  "private": true,
+  "description": "A static browser-based simulator for comparing SCIG schedules.",
+  "scripts": {
+    "test": "node --check script.js && node tests/infusion.test.js && node tests/share-ui.test.js"
+  },
+  "engines": {
+    "node": "^20.19.0 || ^22.13.0 || >=24.0.0"
+  },
+  "devDependencies": {
+    "jsdom": "29.1.1"
+  }
+}
