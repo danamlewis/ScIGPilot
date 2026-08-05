@@ -8,7 +8,8 @@
     <link rel="stylesheet" href="styles.css?v=32">
     <script src="vendor/chart.umd.min.js?v=4.4.1" defer></script>
     <script src="qrcode.js" defer></script>
-    <script src="script.js?v=41" defer></script>
+    <script src="vendor/fflate.min.js?v=0.8.3" defer></script>
+    <script src="script.js?v=43" defer></script>
   </head>
   <body>
     <header class="hero">
@@ -569,7 +570,7 @@
             <div class="share-url-block">
               <label>
                 Share link
-                <textarea id="shareUrl" readonly rows="3"></textarea>
+                <input id="shareUrl" type="url" readonly spellcheck="false">
               </label>
               <p id="shareStatus" class="share-status">Share link pending.</p>
             </div>
@@ -595,7 +596,7 @@
       <section id="printReportSummary" class="print-report" aria-label="Printable share report"></section>
     </main>
     <footer class="site-footer">
-      <span>SCIG Schedule Simulator v0.1.0</span>
+      <span>SCIG Schedule Simulator v0.1.1</span>
       <a href="https://github.com/danamlewis/ScIGPilot">View source on GitHub</a>
     </footer>
   </body>

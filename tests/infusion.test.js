@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 
 const code = fs.readFileSync("script.js", "utf8");
+const fflateCode = fs.readFileSync("vendor/fflate.min.js", "utf8");
 const context = {
   console,
   structuredClone,
@@ -13,6 +14,7 @@ const context = {
 };
 
 vm.createContext(context);
+vm.runInContext(fflateCode, context);
 vm.runInContext(`${code}
 globalThis.__testApi = {
   presets,
@@ -35,7 +37,10 @@ globalThis.__testApi = {
   formatMinutes,
   productPresets,
   state,
+  serializeFullSimulatorState,
   serializeSimulatorState,
+  buildCanonicalShareState,
+  materializeShareState,
   encodeSharePayload,
   decodeSharePayload,
   applySimulatorState,
@@ -62,7 +67,10 @@ const {
   formatMinutes,
   productPresets,
   state,
+  serializeFullSimulatorState,
   serializeSimulatorState,
+  buildCanonicalShareState,
+  materializeShareState,
   encodeSharePayload,
   decodeSharePayload,
   applySimulatorState,
@@ -296,6 +304,24 @@ console.log("switch scenario tests passed");
 console.log("extended interval tests passed");
 
 {
+  sameArray(serializeSimulatorState(), { v: 2 });
+  const defaultPayload = { v: 2 };
+  const defaultState = materializeShareState(defaultPayload);
+  sameArray(defaultState, buildCanonicalShareState());
+  assert.equal(defaultState.g.m, "replacement");
+  assert.equal(defaultState.g.w, 65);
+  assert.equal(defaultState.r.n, "35 mL every 7 days");
+
+  const neurologicPayload = { v: 2, b: { m: "neurologic", w: 75 } };
+  const neurologicState = materializeShareState(neurologicPayload);
+  assert.equal(neurologicState.g.m, "neurologic");
+  assert.equal(neurologicState.g.w, 75);
+  assert.equal(neurologicState.d.pd, 0.4);
+  assert.equal(neurologicState.d.tm, 150);
+  assert.equal(neurologicState.r.n, "150 mL every 7 days");
+  assert.equal(neurologicState.cs[0].n, "150 mL every 9 days");
+  assert.equal(neurologicState.cs[1].n, "150 mL every 14 days");
+
   state.product.presetId = "cuvitru";
   state.product.name = "Cuvitru 20%";
   state.product.concentrationGPerMl = 0.2;
@@ -307,6 +333,8 @@ console.log("extended interval tests passed");
   state.dosing.totalDoseUnit = "mL";
   state.dosing.totalDoseMl = 120;
   state.dosing.totalDoseG = 24;
+  state.dosing.requestedWeeklyDoseMl = 120;
+  state.dosing.requestedWeeklyDoseG = 24;
   state.params.absorptionHalfTimeDays = 1.8;
   state.params.eliminationHalfLifeDays = 28;
   state.params.simulationHorizonDays = 365;
@@ -346,6 +374,9 @@ console.log("extended interval tests passed");
   const token = encodeSharePayload(payload);
   assert.ok(token.length > 100);
   sameArray(decodeSharePayload(token), payload);
+  const unicodePayload = structuredClone(payload);
+  unicodePayload.o.r.n = "Café schedule – Δ";
+  sameArray(decodeSharePayload(encodeSharePayload(unicodePayload)), unicodePayload);
 
   state.product.name = "Changed product";
   state.product.cartridgeSelectionMode = "auto";
@@ -373,20 +404,20 @@ console.log("extended interval tests passed");
   assert.equal(selectedCartridgeVolume(state.product.cartridgeInventory), 120);
 
   const hostilePayload = structuredClone(payload);
-  hostilePayload.m.h = 1000000000;
-  hostilePayload.m.ts = 0.000001;
-  hostilePayload.g.w = 1000000;
-  hostilePayload.r.n = '<img id="unsafe-shared-markup" src=x>';
-  hostilePayload.cs = Array.from({ length: 20 }, (_item, index) => ({
+  hostilePayload.o ||= {};
+  hostilePayload.o.m = { h: 1000000000, ts: 0.000001 };
+  hostilePayload.o.g = { w: 1000000 };
+  hostilePayload.o.r = { n: '<img id="unsafe-shared-markup" src=x>' };
+  hostilePayload.o.cs = Array.from({ length: 20 }, (_item, index) => ({
     i: `\" onmouseover=\"unsafe-${index}`,
     p: "custom",
     n: `Comparator ${index}`,
     c: 1000000,
     e: Array.from({ length: 30 }, () => [-20, 1000000, 100]),
   }));
-  hostilePayload.a = hostilePayload.cs[3].i;
-  hostilePayload.sw = hostilePayload.cs[4].i;
-  hostilePayload.x.r = hostilePayload.cs[2].i;
+  hostilePayload.o.a = hostilePayload.o.cs[3].i;
+  hostilePayload.o.sw = hostilePayload.o.cs[4].i;
+  hostilePayload.o.x = { r: hostilePayload.o.cs[2].i };
   assert.equal(applySimulatorState(hostilePayload), true);
   assert.equal(state.params.simulationHorizonDays, 365, "unknown simulation horizons should fall back to a safe allowed value");
   assert.equal(state.params.timestepDays, 0.25, "unknown timesteps should fall back to a safe allowed value");
@@ -399,7 +430,12 @@ console.log("extended interval tests passed");
   assert.equal(state.activeComparatorId, "comp-4");
   assert.equal(state.switchComparatorId, "comp-1", "a selection beyond the comparator limit should fall back safely");
   assert.equal(state.interval.regimenId, "comp-3");
+  assert.throws(() => decodeSharePayload("z1.a"), /invalid/);
   assert.throws(() => decodeSharePayload("a".repeat(24001)), /too large/);
+  assert.throws(() => encodeSharePayload({ v: 2, pad: "x".repeat(25000) }), /state is too large/);
+  const oversizedCompressed = context.fflate.gzipSync(Buffer.from(JSON.stringify({ v: 2, pad: "x".repeat(25000) })), { level: 9, mtime: 0 });
+  const oversizedToken = `z1.${Buffer.from(oversizedCompressed).toString("base64url")}`;
+  assert.throws(() => decodeSharePayload(oversizedToken), /state is too large/);
 }
 
 console.log("share state round-trip tests passed");

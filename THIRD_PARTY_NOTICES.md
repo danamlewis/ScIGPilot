@@ -16,6 +16,16 @@ Licensed under the MIT License:
 
 Source: <https://github.com/chartjs/Chart.js/tree/v4.4.1>
 
+## fflate 0.8.3
+
+fflate is vendored at `vendor/fflate.min.js` for synchronous compression and decompression of simulator share links. Its upstream license is retained at `vendor/fflate-LICENSE.md`.
+
+Copyright (c) 2026 Arjun Barrett
+
+Licensed under the MIT License.
+
+Source: <https://github.com/101arrowz/fflate/tree/v0.8.3>
+
 ## QR Code Generator for JavaScript
 
 The vendored `qrcode.js` is by Kazuhiko Arase.

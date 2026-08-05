@@ -9,6 +9,7 @@ const { JSDOM } = require("jsdom");
 const root = path.resolve(__dirname, "..");
 const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
 const qrCode = fs.readFileSync(path.join(root, "qrcode.js"), "utf8");
+const fflateCode = fs.readFileSync(path.join(root, "vendor", "fflate.min.js"), "utf8");
 const appCode = fs.readFileSync(path.join(root, "script.js"), "utf8");
 
 function createApp(url = "http://localhost:4183/", { withChart = true } = {}) {
@@ -60,9 +61,16 @@ function createApp(url = "http://localhost:4183/", { withChart = true } = {}) {
     };
   }
   window.print = () => undefined;
-  window.navigator.clipboard = { writeText: async () => undefined };
+  let copiedText = "";
+  window.navigator.clipboard = {
+    writeText: async (value) => {
+      copiedText = value;
+    },
+  };
+  dom.getCopiedText = () => copiedText;
   const context = dom.getInternalVMContext();
   vm.runInContext(qrCode, context);
+  vm.runInContext(fflateCode, context);
   vm.runInContext(`${appCode}\ninit();`, context);
   return dom;
 }
@@ -78,8 +86,82 @@ function setValue(dom, id, value) {
   element.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
 }
 
-{
+async function run() {
   const dom = createApp();
+
+  const defaultShareUrl = new URL(input(dom, "shareUrl").value);
+  const defaultPayload = vm.runInContext(
+    `decodeSharePayload(${JSON.stringify(defaultShareUrl.searchParams.get("s"))})`,
+    dom.getInternalVMContext(),
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(defaultPayload)), { v: 2 }, "the untouched simulator should not repeat default values in its URL");
+
+  const replacement55Dom = createApp();
+  setValue(replacement55Dom, "bodyWeightKg", "55");
+  const replacement55Url = new URL(input(replacement55Dom, "shareUrl").value);
+  const replacement55Payload = vm.runInContext(
+    `decodeSharePayload(${JSON.stringify(replacement55Url.searchParams.get("s"))})`,
+    replacement55Dom.getInternalVMContext(),
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(replacement55Payload)),
+    { v: 2, b: { w: 55 } },
+    "a generated replacement case should share only its changed weight",
+  );
+
+  const neurologic75Dom = createApp();
+  setValue(neurologic75Dom, "iggScenarioMode", "neurologic");
+  setValue(neurologic75Dom, "bodyWeightKg", "75");
+  const neurologic75Url = new URL(input(neurologic75Dom, "shareUrl").value);
+  const neurologic75Payload = vm.runInContext(
+    `decodeSharePayload(${JSON.stringify(neurologic75Url.searchParams.get("s"))})`,
+    neurologic75Dom.getInternalVMContext(),
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(neurologic75Payload)),
+    { v: 2, b: { m: "neurologic", w: 75 } },
+    "a generated neurologic case should share only its selected profile and changed weight",
+  );
+
+  const customDoseDom = createApp();
+  setValue(customDoseDom, "iggScenarioMode", "custom");
+  setValue(customDoseDom, "bodyWeightKg", "70");
+  setValue(customDoseDom, "protocolDoseGKgWeek", "0.2");
+  const customDoseUrl = new URL(input(customDoseDom, "shareUrl").value);
+  const customDosePayload = vm.runInContext(
+    `decodeSharePayload(${JSON.stringify(customDoseUrl.searchParams.get("s"))})`,
+    customDoseDom.getInternalVMContext(),
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(customDosePayload)),
+    { v: 2, b: { m: "custom", w: 70, d: 0.2 } },
+    "custom source inputs should rebuild their generated dose and schedules without redundant overrides",
+  );
+  const customDoseHydrated = createApp(customDoseUrl.toString());
+  assert.equal(input(customDoseHydrated, "iggScenarioMode").value, "custom");
+  assert.equal(input(customDoseHydrated, "bodyWeightKg").value, "70");
+  assert.equal(input(customDoseHydrated, "protocolDoseGKgWeek").value, "0.2");
+  assert.equal(customDoseHydrated.window.document.querySelector('[data-type="reference"][data-field="volumeMl"]').value, "70");
+
+  const editedNeurologicDom = createApp(neurologic75Url.toString());
+  const editNeurologicComparator = input(editedNeurologicDom, "comparatorManager")
+    .querySelector('[data-action="select-comparator"][data-comparator-id="comp-1"]');
+  editNeurologicComparator.dispatchEvent(new editedNeurologicDom.window.Event("click", { bubbles: true }));
+  const neurologicCycle = input(editedNeurologicDom, "candidateEditor").querySelector('[data-field="cycleLengthDays"]');
+  neurologicCycle.value = "10";
+  neurologicCycle.dispatchEvent(new editedNeurologicDom.window.Event("change", { bubbles: true }));
+  const editedNeurologicUrl = new URL(input(editedNeurologicDom, "shareUrl").value);
+  const editedNeurologicPayload = vm.runInContext(
+    `decodeSharePayload(${JSON.stringify(editedNeurologicUrl.searchParams.get("s"))})`,
+    editedNeurologicDom.getInternalVMContext(),
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(editedNeurologicPayload.b)), { m: "neurologic", w: 75 });
+  assert.ok(Array.isArray(editedNeurologicPayload.o.cs), "a manual comparator edit should be retained as an override");
+  assert.equal(editedNeurologicPayload.o.d, undefined, "derived dose values should not be repeated beside a regimen override");
+  const editedNeurologicHydrated = createApp(editedNeurologicUrl.toString());
+  const hydratedComparators = Array.from(input(editedNeurologicHydrated, "comparatorManager").querySelectorAll(".comparator-summary strong"));
+  assert.ok(hydratedComparators[0].textContent.includes("every 10 days"));
+  assert.ok(hydratedComparators[1].textContent.includes("every 14 days"));
 
   const patientProfilePanel = input(dom, "setup");
   const doseSetupPanel = input(dom, "doseSetupPanel");
@@ -138,7 +220,7 @@ function setValue(dom, id, value) {
   assert.equal(chartScript.hasAttribute("integrity"), false, "the local Chart.js asset should not retain CDN-only integrity metadata");
   assert.equal(fs.existsSync(path.join(root, "vendor", "Chart.js-LICENSE.md")), true, "the vendored Chart.js license should be retained");
   const siteFooter = dom.window.document.querySelector(".site-footer");
-  assert.ok(siteFooter.textContent.includes("v0.1.0"), "the browser footer should identify the release version");
+  assert.ok(siteFooter.textContent.includes("v0.1.1"), "the browser footer should identify the release version");
   assert.equal(siteFooter.querySelector("a").href, "https://github.com/danamlewis/ScIGPilot", "the browser footer should link to the repository");
   assert.deepEqual(Array.from(input(dom, "productPreset").options).map((option) => option.value), ["hizentra", "cuvitru", "xembify", "custom"]);
   assert.equal(interpretationNotes.querySelectorAll("article").length, 0, "interpretation notes should be compact helper copy, not cards");
@@ -332,8 +414,12 @@ function setValue(dom, id, value) {
 
   const shareUrl = input(dom, "shareUrl").value;
   const qrSvg = dom.window.document.querySelector("#shareQr svg");
-  const shareHashParams = new URLSearchParams(new URL(shareUrl).hash.slice(1));
-  assert.ok(shareHashParams.get("s"), "share URL should include encoded state in the fragment");
+  const parsedShareUrl = new URL(shareUrl);
+  const validToken = parsedShareUrl.searchParams.get("s");
+  assert.ok(validToken, "share URL should include encoded state in the query string");
+  assert.ok(validToken.startsWith("z1."), "share state should use the compressed token format");
+  assert.equal(/\s/.test(shareUrl), false, "share URL should not contain whitespace or line breaks");
+  assert.equal(input(dom, "shareUrl").tagName, "INPUT", "share URL should display in a single-line field");
   assert.ok(qrSvg, "QR SVG should be generated");
   assert.ok(qrSvg.querySelectorAll("path").length > 0, "QR SVG should contain path modules");
   assert.match(dom.window.document.title, /^SCIG Schedule Simulator - [A-Z][a-z]{2}-\d{1,2}-\d{4}$/, "PDF title should suggest a dated filename");
@@ -351,7 +437,7 @@ function setValue(dom, id, value) {
   assert.equal(printReport.textContent.includes(shareUrl), false, "the encoded share URL should not be printed as a long visible string");
   assert.equal(printReport.querySelector(".print-share-card a").getAttribute("href"), shareUrl, "the PDF should preserve a clickable setup link");
   assert.equal(printReport.querySelectorAll(".print-page-footer").length, 5, "every PDF page should include a footer");
-  assert.ok(Array.from(printReport.querySelectorAll(".print-page-footer")).every((footer) => footer.textContent.includes("v0.1.0")), "every PDF page should identify the release version");
+  assert.ok(Array.from(printReport.querySelectorAll(".print-page-footer")).every((footer) => footer.textContent.includes("v0.1.1")), "every PDF page should identify the release version");
   assert.ok(Array.from(printReport.querySelectorAll(".print-page-footer a")).every((link) => link.getAttribute("href") === "https://github.com/danamlewis/ScIGPilot"), "every PDF page should link to the repository");
   dom.window.dispatchEvent(new dom.window.Event("afterprint"));
   assert.equal(dom.window.document.title, titleBeforePrint, "the browser tab title should be restored after printing");
@@ -366,32 +452,42 @@ function setValue(dom, id, value) {
   assert.equal(input(hydrated, "switchPreconditionDays").value, "168");
   assert.equal(input(hydrated, "intervalHorizonDays").value, "120");
   assert.equal(input(hydrated, "intervalUpperThreshold").value, "1450");
-  assert.ok(new URLSearchParams(new URL(input(hydrated, "shareUrl").value).hash.slice(1)).get("s"), "hydrated page should regenerate its share link");
+  assert.ok(new URL(input(hydrated, "shareUrl").value).searchParams.get("s"), "hydrated page should regenerate its compressed query-string link");
 
   const hydratedResultsLink = hydrated.window.document.querySelector('.section-nav a[href="#results"]');
   hydratedResultsLink.dispatchEvent(new hydrated.window.MouseEvent("click", { bubbles: true, cancelable: true }));
-  const navigatedHashParams = new URLSearchParams(hydrated.window.location.hash.slice(1));
-  assert.equal(navigatedHashParams.get("section"), "results", "section navigation should coexist with shared state");
-  assert.ok(navigatedHashParams.get("s"), "section navigation should preserve an encoded state token");
+  const navigatedUrl = new URL(hydrated.window.location.href);
+  assert.equal(navigatedUrl.hash, "#results", "section navigation should use a conventional anchor");
+  assert.ok(navigatedUrl.searchParams.get("s"), "section navigation should preserve the compressed state query");
   const navigatedHydrated = createApp(hydrated.window.location.href);
   assert.equal(input(navigatedHydrated, "bodyWeightKg").value, "72", "refreshing after section navigation should retain shared state");
-  assert.equal(new URLSearchParams(navigatedHydrated.window.location.hash.slice(1)).get("section"), "results");
+  assert.equal(navigatedHydrated.window.location.hash, "#results");
 
-  const validToken = shareHashParams.get("s");
-  const paddedToken = validToken.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(validToken.length / 4) * 4, "=");
-  const hostilePayload = JSON.parse(Buffer.from(paddedToken, "base64").toString("utf8"));
-  hostilePayload.r.n = '<img id="unsafe-shared-markup" src=x>';
-  hostilePayload.cs[0].i = '\" onmouseover=\"unsafe';
-  hostilePayload.cs[0].n = '<svg id="unsafe-comparator-markup">';
-  hostilePayload.a = hostilePayload.cs[0].i;
-  hostilePayload.sw = hostilePayload.cs[0].i;
-  hostilePayload.x.r = hostilePayload.cs[0].i;
-  const hostileToken = Buffer.from(JSON.stringify(hostilePayload), "utf8")
+  const context = dom.getInternalVMContext();
+  const hostilePayload = vm.runInContext(`decodeSharePayload(${JSON.stringify(validToken)})`, context);
+  const uncompressedToken = Buffer.from(JSON.stringify(hostilePayload), "utf8")
     .toString("base64")
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/g, "");
-  const hostileHydrated = createApp(`http://localhost:4183/#s=${hostileToken}`);
+  assert.ok(
+    validToken.length <= uncompressedToken.length * 0.65,
+    `compressed state should be at least 35% shorter than the former base64 JSON token (${validToken.length} vs ${uncompressedToken.length})`,
+  );
+  hostilePayload.o ||= {};
+  hostilePayload.o.r = { n: '<img id="unsafe-shared-markup" src=x>' };
+  hostilePayload.o.cs = [{
+    i: '\" onmouseover=\"unsafe',
+    p: "custom",
+    n: '<svg id="unsafe-comparator-markup">',
+    c: 14,
+    e: [[0, 120, 4]],
+  }];
+  hostilePayload.o.a = hostilePayload.o.cs[0].i;
+  hostilePayload.o.sw = hostilePayload.o.cs[0].i;
+  hostilePayload.o.x = { r: hostilePayload.o.cs[0].i };
+  const hostileToken = vm.runInContext(`encodeSharePayload(${JSON.stringify(hostilePayload)})`, context);
+  const hostileHydrated = createApp(`http://localhost:4183/?s=${hostileToken}`);
   assert.equal(hostileHydrated.window.document.getElementById("unsafe-shared-markup"), null, "shared names must not create markup");
   assert.equal(hostileHydrated.window.document.getElementById("unsafe-comparator-markup"), null, "shared comparator names must not create markup");
   assert.equal(hostileHydrated.window.document.querySelector('[data-comparator-id="comp-1"]') !== null, true, "shared comparator IDs should be regenerated");
@@ -414,6 +510,10 @@ function setValue(dom, id, value) {
   assert.equal(cycleMetricRow.querySelectorAll("td")[2].textContent.trim(), "10", "results should use the committed comparator cycle");
   assert.ok(input(cycleEditDom, "resultsTable").querySelectorAll("thead th")[2].textContent.includes("35 mL every 10 days"), "results should not retain a stale generated name");
 
+  input(dom, "copyShareLink").dispatchEvent(new dom.window.Event("click", { bubbles: true }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(dom.getCopiedText(), shareUrl, "Copy Link should copy the complete query-string URL as one value");
+
   hydrated.window.close();
   hostileHydrated.window.close();
   fallbackDom.window.close();
@@ -424,4 +524,9 @@ function setValue(dom, id, value) {
 
 }
 
-console.log("share UI QR and hydration tests passed");
+run()
+  .then(() => console.log("share UI QR and hydration tests passed"))
+  .catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });

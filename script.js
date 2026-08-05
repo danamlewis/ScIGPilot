@@ -1,6 +1,6 @@
 "use strict";
 
-const APP_VERSION = "0.1.0";
+const APP_VERSION = "0.1.1";
 const REPOSITORY_URL = "https://github.com/danamlewis/ScIGPilot";
 const REPOSITORY_LABEL = "github.com/danamlewis/ScIGPilot";
 
@@ -384,8 +384,10 @@ const formatDose = (value) => `${formatNumber(value, 1)} g`;
 const formatDays = (value) => `${formatNumber(value, Number.isInteger(value) ? 0 : 1)} days`;
 const formatMgDl = (value) => `${formatNumber(value, 0)} mg/dL`;
 const formatInteger = (value) => formatNumber(value, 0);
-const SHARE_PAYLOAD_VERSION = 1;
+const SHARE_PAYLOAD_VERSION = 2;
 const MAX_SHARE_TOKEN_LENGTH = 24000;
+const MAX_SHARE_STATE_BYTES = 24000;
+const SHARE_COMPRESSION_PREFIX = "z1.";
 const MAX_SHARED_COMPARATORS = 4;
 const MAX_SHARED_EVENTS_PER_REGIMEN = 6;
 const MAX_SHARED_EVENT_OCCURRENCES_PER_YEAR = 800;
@@ -407,11 +409,24 @@ function safeLabel(value, fallback, maxLength = 80) {
   return normalized ? normalized.slice(0, maxLength) : fallback;
 }
 
-function utf8ToBase64Url(value) {
+function utf8Bytes(value) {
   if (typeof Buffer !== "undefined") {
-    return Buffer.from(value, "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+    return Uint8Array.from(Buffer.from(value, "utf8"));
   }
-  const bytes = new TextEncoder().encode(value);
+  return new TextEncoder().encode(value);
+}
+
+function utf8String(bytes) {
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(bytes).toString("utf8");
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+function bytesToBase64Url(bytes) {
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(bytes).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
   let binary = "";
   bytes.forEach((byte) => {
     binary += String.fromCharCode(byte);
@@ -419,14 +434,40 @@ function utf8ToBase64Url(value) {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
-function base64UrlToUtf8(value) {
-  const base64 = String(value).replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(String(value).length / 4) * 4, "=");
+function base64UrlToBytes(value) {
+  const encoded = String(value);
+  if (!encoded || encoded.length % 4 === 1 || /[^A-Za-z0-9_-]/.test(encoded)) {
+    throw new Error("Simulator share link is invalid.");
+  }
+  const base64 = encoded.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(encoded.length / 4) * 4, "=");
   if (typeof Buffer !== "undefined") {
-    return Buffer.from(base64, "base64").toString("utf8");
+    return Uint8Array.from(Buffer.from(base64, "base64"));
   }
   const binary = atob(base64);
-  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
-  return new TextDecoder().decode(bytes);
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function compressShareBytes(bytes) {
+  if (typeof fflate === "undefined") throw new Error("Share compression is unavailable.");
+  return fflate.gzipSync(bytes, { level: 9, mtime: 0 });
+}
+
+function decompressShareBytes(bytes) {
+  if (typeof fflate === "undefined") throw new Error("Share compression is unavailable.");
+  if (bytes.length < 18 || bytes[0] !== 0x1f || bytes[1] !== 0x8b) {
+    throw new Error("Simulator share link is invalid.");
+  }
+  const sizeOffset = bytes.length - 4;
+  const declaredSize = bytes[sizeOffset]
+    + bytes[sizeOffset + 1] * 256
+    + bytes[sizeOffset + 2] * 65536
+    + bytes[sizeOffset + 3] * 16777216;
+  if (!declaredSize || declaredSize > MAX_SHARE_STATE_BYTES) {
+    throw new Error("Simulator share state is too large.");
+  }
+  const output = fflate.gunzipSync(bytes, { out: new Uint8Array(declaredSize) });
+  if (output.length !== declaredSize) throw new Error("Simulator share link is invalid.");
+  return output;
 }
 
 function compactInventory(inventory) {
@@ -484,7 +525,7 @@ function expandRegimen(regimen, fallbackId) {
   };
 }
 
-function serializeSimulatorState() {
+function serializeFullSimulatorState() {
   return {
     v: SHARE_PAYLOAD_VERSION,
     p: {
@@ -493,6 +534,7 @@ function serializeSimulatorState() {
       c: Number(state.product.concentrationGPerMl),
       nt: state.product.needleType,
       t: state.product.tubing,
+      s: state.product.cartridgeSizesMl.map(Number),
       cm: state.product.cartridgeSelectionMode,
       ci: compactInventory(state.product.cartridgeInventory),
       rr: Number(state.product.referenceRunMinutes),
@@ -529,7 +571,7 @@ function serializeSimulatorState() {
       el: Number(state.calibration.eliminationHalfLifeLowDays),
       eh: Number(state.calibration.eliminationHalfLifeHighDays),
     },
-    r: compactRegimen(state.reference),
+    r: { ...compactRegimen(state.reference), i: "reference" },
     cs: state.comparators.map(compactRegimen),
     a: state.activeComparatorId,
     sw: state.switchComparatorId,
@@ -545,16 +587,202 @@ function serializeSimulatorState() {
   };
 }
 
+function normalizedShareBasis(basis = {}) {
+  const scenarioMode = allowedValue(basis.m, Object.keys(iggScenarioPresets), "replacement");
+  const productPresetId = allowedValue(basis.p, [...Object.keys(productPresets), "custom"], defaultProductPresetId);
+  const entryMode = basis.e === "total" ? "total" : "protocol";
+  const productCartridgeSizes = productPresetId === "custom" && Array.isArray(basis.k)
+    ? [...new Set(basis.k.slice(0, 12)
+      .map((size) => boundedNumber(size, 0, 0, 1000))
+      .filter((size) => size > 0))].sort((a, b) => b - a)
+    : null;
+  return {
+    scenarioMode,
+    bodyWeightKg: boundedNumber(basis.w, 65, 1, 300),
+    productPresetId,
+    productCartridgeSizes: productCartridgeSizes?.length ? productCartridgeSizes : null,
+    entryMode,
+    protocolDoseGKgWeek: boundedNumber(
+      basis.d,
+      iggScenarioPresets[scenarioMode].protocolDoseGKgWeek,
+      0,
+      5,
+    ),
+    totalDoseUnit: basis.u === "g" ? "g" : "mL",
+    requestedTotalDose: boundedNumber(basis.q, 0, 0, basis.u === "g" ? 1000 : 5000),
+  };
+}
+
+function buildCanonicalShareState(basis = {}) {
+  const normalized = normalizedShareBasis(basis);
+  const scenario = iggScenarioPresets[normalized.scenarioMode];
+  const presetProduct = productPresets[normalized.productPresetId] || productPresets[defaultProductPresetId];
+  const cartridgeSizesMl = normalized.productCartridgeSizes || presetProduct.cartridgeSizesMl;
+  const concentrationGPerMl = presetProduct.concentrationGPerMl;
+  let requestedWeeklyDoseG;
+  let requestedWeeklyDoseMl;
+
+  if (normalized.entryMode === "protocol") {
+    requestedWeeklyDoseG = normalized.protocolDoseGKgWeek * normalized.bodyWeightKg;
+    requestedWeeklyDoseMl = requestedWeeklyDoseG / concentrationGPerMl;
+  } else if (normalized.totalDoseUnit === "g") {
+    requestedWeeklyDoseG = normalized.requestedTotalDose;
+    requestedWeeklyDoseMl = requestedWeeklyDoseG / concentrationGPerMl;
+  } else {
+    requestedWeeklyDoseMl = normalized.requestedTotalDose;
+    requestedWeeklyDoseG = requestedWeeklyDoseMl * concentrationGPerMl;
+  }
+
+  const allocation = autoAllocateProductCartridges(requestedWeeklyDoseMl, cartridgeSizesMl);
+  const weeklyDoseMl = allocation.volumeMl;
+  const weeklyDoseG = weeklyDoseMl * concentrationGPerMl;
+  const generatedPresets = buildPresets(weeklyDoseMl, allocation.inventory);
+  const reference = { ...compactRegimen(generatedPresets[0]), i: "reference" };
+  const comparators = [
+    compactRegimen(createComparatorFromPreset(generatedPresets[1], "comp-1")),
+    compactRegimen(createComparatorFromPreset(generatedPresets[2], "comp-2")),
+  ];
+
+  return {
+    v: SHARE_PAYLOAD_VERSION,
+    p: {
+      i: normalized.productPresetId,
+      n: presetProduct.name,
+      c: concentrationGPerMl,
+      nt: "highFlo26G",
+      t: "F2400",
+      s: cartridgeSizesMl.map(Number),
+      cm: "auto",
+      ci: compactInventory(allocation.inventory),
+      rr: 46,
+    },
+    d: {
+      e: normalized.entryMode,
+      pd: normalized.protocolDoseGKgWeek,
+      tu: normalized.totalDoseUnit,
+      tm: weeklyDoseMl,
+      tg: weeklyDoseG,
+    },
+    m: { a: 1.4, e: 30, h: 180, ts: 0.25, sp: 140, sh: 180 },
+    g: {
+      m: normalized.scenarioMode,
+      w: normalized.bodyWeightKg,
+      b: scenario.baselinePreScigIggMgDl,
+      s: slopeFromPreset(scenario, normalized.bodyWeightKg),
+      pr: scenario.peakToTroughRatio,
+      tx: scenario.tmaxDaysAfterWeeklyInfusion,
+      ll: 586,
+      lh: 1602,
+      hw: scenario.highIggWarningThresholdMgDl,
+      bu: 100,
+      su: 20,
+      al: 1,
+      ah: 3,
+      el: 21,
+      eh: 35,
+    },
+    r: reference,
+    cs: comparators,
+    a: "comp-1",
+    sw: "comp-1",
+    cw: "all",
+    cm: "igg",
+    x: { r: "reference", h: 180, d: 7, u: 1602, l: 586 },
+  };
+}
+
+function currentShareBasis() {
+  const basis = {};
+  const scenarioMode = allowedValue(state.calibration.mode, Object.keys(iggScenarioPresets), "replacement");
+  const scenario = iggScenarioPresets[scenarioMode];
+  const bodyWeightKg = Number(state.calibration.bodyWeightKg);
+  const productPresetId = allowedValue(state.product.presetId, [...Object.keys(productPresets), "custom"], defaultProductPresetId);
+  const requestedProtocolDose = Number(state.dosing.requestedProtocolDoseGKgWeek ?? state.dosing.protocolDoseGKgWeek);
+
+  if (scenarioMode !== "replacement") basis.m = scenarioMode;
+  if (bodyWeightKg !== 65) basis.w = bodyWeightKg;
+  if (productPresetId !== defaultProductPresetId) basis.p = productPresetId;
+  if (productPresetId === "custom") basis.k = state.product.cartridgeSizesMl.map(Number);
+  if (state.dosing.entryMode === "total") {
+    basis.e = "total";
+    if (state.dosing.totalDoseUnit === "g") basis.u = "g";
+    basis.q = Number(state.dosing.totalDoseUnit === "g"
+      ? state.dosing.requestedWeeklyDoseG
+      : state.dosing.requestedWeeklyDoseMl);
+  } else if (requestedProtocolDose !== Number(scenario.protocolDoseGKgWeek)) {
+    basis.d = requestedProtocolDose;
+  }
+  return basis;
+}
+
+function sameJsonValue(first, second) {
+  if (Object.is(first, second)) return true;
+  if (Array.isArray(first) || Array.isArray(second)) {
+    return Array.isArray(first)
+      && Array.isArray(second)
+      && first.length === second.length
+      && first.every((value, index) => sameJsonValue(value, second[index]));
+  }
+  if (!first || !second || typeof first !== "object" || typeof second !== "object") return false;
+  const firstKeys = Object.keys(first);
+  const secondKeys = Object.keys(second);
+  return firstKeys.length === secondKeys.length
+    && firstKeys.every((key) => Object.hasOwn(second, key) && sameJsonValue(first[key], second[key]));
+}
+
+function sparseShareDiff(actual, baseline) {
+  if (sameJsonValue(actual, baseline)) return undefined;
+  if (Array.isArray(actual) || !actual || typeof actual !== "object") return structuredClone(actual);
+  const difference = {};
+  Object.keys(actual).forEach((key) => {
+    const valueDifference = sparseShareDiff(actual[key], baseline?.[key]);
+    if (valueDifference !== undefined) difference[key] = valueDifference;
+  });
+  return Object.keys(difference).length ? difference : undefined;
+}
+
+function mergeShareOverrides(baseline, overrides) {
+  if (Array.isArray(baseline)) return Array.isArray(overrides) ? structuredClone(overrides) : structuredClone(baseline);
+  if (!baseline || typeof baseline !== "object") return overrides === undefined ? baseline : overrides;
+  const merged = {};
+  Object.keys(baseline).forEach((key) => {
+    merged[key] = Object.hasOwn(overrides || {}, key)
+      ? mergeShareOverrides(baseline[key], overrides[key])
+      : structuredClone(baseline[key]);
+  });
+  return merged;
+}
+
+function materializeShareState(payload) {
+  if (!payload || payload.v !== SHARE_PAYLOAD_VERSION) return null;
+  const baseline = buildCanonicalShareState(payload.b || {});
+  return mergeShareOverrides(baseline, payload.o || {});
+}
+
+function serializeSimulatorState() {
+  const basis = currentShareBasis();
+  const fullState = serializeFullSimulatorState();
+  const baseline = buildCanonicalShareState(basis);
+  const overrides = sparseShareDiff(fullState, baseline);
+  const payload = { v: SHARE_PAYLOAD_VERSION };
+  if (Object.keys(basis).length) payload.b = basis;
+  if (overrides && Object.keys(overrides).length) payload.o = overrides;
+  return payload;
+}
+
 function encodeSharePayload(payload) {
-  return utf8ToBase64Url(JSON.stringify(payload));
+  const sourceBytes = utf8Bytes(JSON.stringify(payload));
+  if (sourceBytes.length > MAX_SHARE_STATE_BYTES) throw new Error("Simulator share state is too large.");
+  return `${SHARE_COMPRESSION_PREFIX}${bytesToBase64Url(compressShareBytes(sourceBytes))}`;
 }
 
 function decodeSharePayload(value) {
   if (typeof value !== "string" || value.length > MAX_SHARE_TOKEN_LENGTH) {
     throw new Error("Simulator share link is too large.");
   }
-  const decoded = base64UrlToUtf8(value);
-  if (decoded.length > MAX_SHARE_TOKEN_LENGTH) throw new Error("Simulator share state is too large.");
+  if (!value.startsWith(SHARE_COMPRESSION_PREFIX)) throw new Error("Unsupported simulator share link format.");
+  const compressed = base64UrlToBytes(value.slice(SHARE_COMPRESSION_PREFIX.length));
+  const decoded = utf8String(decompressShareBytes(compressed));
   const payload = JSON.parse(decoded);
   if (!payload || payload.v !== SHARE_PAYLOAD_VERSION) {
     throw new Error("Unsupported simulator share link version.");
@@ -564,20 +792,15 @@ function decodeSharePayload(value) {
 
 function buildShareUrl() {
   const url = new URL(window.location.href);
-  const hashParams = new URLSearchParams();
-  hashParams.set("s", encodeSharePayload(serializeSimulatorState()));
   const section = currentSectionFromUrl();
-  if (section) hashParams.set("section", section);
-  url.hash = hashParams.toString();
   url.search = "";
+  url.searchParams.set("s", encodeSharePayload(serializeSimulatorState()));
+  url.hash = section || "";
   return url.toString();
 }
 
 function readShareTokenFromUrl() {
-  const hash = window.location.hash.startsWith("#") ? window.location.hash.slice(1) : window.location.hash;
-  const hashParams = new URLSearchParams(hash);
-  const queryParams = new URLSearchParams(window.location.search);
-  return hashParams.get("s") || queryParams.get("s");
+  return new URLSearchParams(window.location.search).get("s");
 }
 
 function currentSectionFromUrl() {
@@ -596,20 +819,17 @@ function navigateToSection(sectionId) {
 
   const url = new URL(window.location.href);
   if (readShareTokenFromUrl()) {
-    const hashParams = new URLSearchParams();
-    hashParams.set("s", encodeSharePayload(serializeSimulatorState()));
-    hashParams.set("section", sectionId);
-    url.searchParams.delete("s");
-    url.hash = hashParams.toString();
-  } else {
-    url.hash = sectionId;
+    url.search = "";
+    url.searchParams.set("s", encodeSharePayload(serializeSimulatorState()));
   }
+  url.hash = sectionId;
   window.history.replaceState(null, "", url.toString());
   return true;
 }
 
 function applySimulatorState(payload) {
-  if (!payload || payload.v !== SHARE_PAYLOAD_VERSION) return false;
+  payload = materializeShareState(payload);
+  if (!payload) return false;
   const product = payload.p || {};
   const dosing = payload.d || {};
   const params = payload.m || {};
@@ -624,6 +844,11 @@ function applySimulatorState(payload) {
   state.product.cartridgeSelectionMode = product.cm === "manual" ? "manual" : "auto";
   if (productPresets[state.product.presetId]) {
     state.product.cartridgeSizesMl = productPresets[state.product.presetId].cartridgeSizesMl;
+  } else if (Array.isArray(product.s)) {
+    const sharedSizes = [...new Set(product.s.slice(0, 12)
+      .map((size) => boundedNumber(size, 0, 0, 1000))
+      .filter((size) => size > 0))].sort((a, b) => b - a);
+    if (sharedSizes.length) state.product.cartridgeSizesMl = sharedSizes;
   }
   const inventory = expandInventory(product.ci);
   if (inventory.length) {

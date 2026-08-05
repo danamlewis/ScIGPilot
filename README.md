@@ -70,14 +70,14 @@ This can help someone plan a clinician discussion about which interval checkpoin
 
 ## Share a Configuration
 
-Open **Share or export this setup** and choose **Copy Link**. The URL encodes the current product, patient-profile assumptions, reference and comparator schedules, selected chart, and extended-interval settings. A recipient opening the link starts from the same configuration and can then edit their own copy.
+Open **Share or export this setup** and choose **Copy Link**. The URL records the selected profile and other inputs that differ from the simulator defaults. Generated dose amounts, cartridge allocations, and standard schedules are rebuilt from those inputs instead of being repeated in the URL; manually edited regimens and assumptions are retained as compact overrides. A recipient opening the link starts from the same configuration and can then edit their own copy.
 
 ![Share link, QR code, and PDF export controls](docs/images/share-and-export.png)
 
 The link uses the site address from which the simulator is currently running:
 
 - local testing creates a `http://127.0.0.1:4183/...` or `file://...` link that generally works only in that local environment;
-- a deployed GitHub Pages copy creates an HTTPS link such as `https://danamlewis.github.io/ScIGPilot/#s=...`, which can be opened on another device;
+- a deployed GitHub Pages copy creates a compressed HTTPS link such as `https://danamlewis.github.io/ScIGPilot/?s=...`, which can be opened on another device and pasted as a complete link in messaging apps;
 - the QR code contains the same link as **Copy Link**.
 
 Configure the scenario on the deployed site before copying a link intended for someone else. Shared links are readable configuration data: do not put names, dates of birth, identifiers, or other sensitive health information in regimen names.

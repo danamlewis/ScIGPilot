@@ -310,7 +310,7 @@ For the reference regimen, cartridge feasibility is true only when each event-da
 
 ## Shared-State Validation
 
-Shared URLs contain a compact JSON representation of the current configuration in the URL fragment. An optional `section` fragment parameter coexists with the state token so in-page navigation and refresh do not discard the shared setup. Shared URLs do not contain model code and are not a private storage format. On hydration, the implementation:
+Shared URLs contain a compressed, compact JSON token in the `s` query parameter. The token stores only source selections and values that differ from the applicable defaults. For example, a 75 kg neurologic scenario stores the profile and weight; its dose, cartridge allocation, and generated q7/q9/q14 schedules are rebuilt from those inputs. Manually edited regimens or assumptions are stored as sparse overrides. A normal URL fragment such as `#results` can therefore be used for in-page navigation without splitting the share token. Shared URLs do not contain model code and are not a private storage format. On hydration, the implementation:
 
 - rejects unsupported payload versions and tokens longer than 24,000 characters;
 - limits a payload to four comparators, six events per regimen, twelve inventory entries, and at most 800 repeated event occurrences per modeled year;
