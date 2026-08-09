@@ -3192,7 +3192,7 @@ function metricTable(referenceMetrics, comparatorSims) {
     ["Max sites per infusion day", (m) => formatNumber(m.maxSitesPerInfusionDay, 0)],
     ["Max volume per site (mL/site)", (m) => formatNumber(m.maxMlPerSite, 1)],
     ["Average volume per site (mL/site)", (m) => formatNumber(m.averageMlPerSite, 1)],
-    ["Estimated infusion time", (m) => formatInfusionTimeCell(m)],
+    ["Estimated infusion time per dose day", (m) => formatInfusionTimeCell(m)],
     ["Cartridge feasibility", (m) => m.cartridgeFeasible
       ? '<span class="metric-status metric-status-ok" aria-label="Matches available cartridges" title="Matches available cartridges">✓</span>'
       : '<span class="metric-status metric-status-warning" aria-label="Needs unavailable cartridge mix" title="Needs unavailable cartridge mix">!</span>'],
@@ -3226,9 +3226,18 @@ function metricTable(referenceMetrics, comparatorSims) {
 }
 
 function formatInfusionTimeCell(metrics) {
+  const infusionTimes = Array.isArray(metrics.infusionTimes) ? metrics.infusionTimes : [];
+  if (infusionTimes.length > 1) {
+    return `
+      <span class="infusion-time-cell infusion-time-cell-multiple">
+        ${infusionTimes.map((time, index) => formatInfusionDoseTime(time, index)).join("")}
+      </span>
+    `;
+  }
+
   const maxMinutes = Math.round(Number(metrics.maxInfusionMinutes));
-  const maxDay = metrics.infusionTimes.find((time) => Math.round(Number(time.hours) * 60) === maxMinutes)
-    || metrics.infusionTimes[0];
+  const maxDay = infusionTimes.find((time) => Math.round(Number(time.hours) * 60) === maxMinutes)
+    || infusionTimes[0];
   const breakdown = maxDay ? formatInfusionMinuteBreakdown(maxDay) : "";
   const feasibility = maxDay && !maxDay.feasible
     ? '<small class="infusion-time-warning">Unavailable cartridge mix</small>'
@@ -3236,6 +3245,23 @@ function formatInfusionTimeCell(metrics) {
   return `
     <span class="infusion-time-cell">
       <strong>${formatMinutes(metrics.maxInfusionMinutes)}</strong>
+      ${breakdown ? `<small>(${breakdown})</small>` : ""}
+      ${feasibility}
+    </span>
+  `;
+}
+
+function formatInfusionDoseTime(time, index) {
+  const breakdown = formatInfusionMinuteBreakdown(time);
+  const day = Number(time.day);
+  const dayLabel = formatNumber(day, Number.isInteger(day) ? 0 : 1);
+  const feasibility = !time.feasible
+    ? '<small class="infusion-time-warning">Unavailable cartridge mix</small>'
+    : "";
+  return `
+    <span class="infusion-dose-time">
+      <small class="infusion-dose-label">Dose ${index + 1} · day ${dayLabel}</small>
+      <strong>${formatMinutes(time.minutes)}</strong>
       ${breakdown ? `<small>(${breakdown})</small>` : ""}
       ${feasibility}
     </span>

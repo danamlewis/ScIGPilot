@@ -163,6 +163,33 @@ async function run() {
   assert.ok(hydratedComparators[0].textContent.includes("every 10 days"));
   assert.ok(hydratedComparators[1].textContent.includes("every 14 days"));
 
+  const splitDoseDom = createApp();
+  const editSplitDoseComparator = input(splitDoseDom, "comparatorManager")
+    .querySelector('[data-action="select-comparator"][data-comparator-id="comp-2"]');
+  editSplitDoseComparator.dispatchEvent(new splitDoseDom.window.Event("click", { bubbles: true }));
+  input(splitDoseDom, "candidateEditor").querySelector('[data-action="add-event"]')
+    .dispatchEvent(new splitDoseDom.window.Event("click", { bubbles: true }));
+  [
+    [0, "volumeMl", 20],
+    [0, "sites", 2],
+    [1, "day", 7],
+    [1, "volumeMl", 15],
+    [1, "sites", 2],
+  ].forEach(([eventIndex, field, value]) => {
+    const eventInput = input(splitDoseDom, "candidateEditor")
+      .querySelector(`[data-event-index="${eventIndex}"][data-field="${field}"]`);
+    eventInput.value = String(value);
+    eventInput.dispatchEvent(new splitDoseDom.window.Event("change", { bubbles: true }));
+  });
+  const splitDoseTimeRow = Array.from(input(splitDoseDom, "resultsTable").querySelectorAll("tbody tr"))
+    .find((row) => row.querySelector("td").textContent.trim() === "Estimated infusion time per dose day");
+  const splitDoseCell = splitDoseTimeRow.querySelectorAll("td")[3];
+  const splitDoseTimes = Array.from(splitDoseCell.querySelectorAll(".infusion-dose-time"));
+  assert.equal(splitDoseTimes.length, 2, "a two-day comparator should show both infusion-day estimates");
+  assert.ok(splitDoseTimes[0].textContent.replace(/\s+/g, " ").trim().startsWith("Dose 1 · day 0"));
+  assert.ok(splitDoseTimes[1].textContent.replace(/\s+/g, " ").trim().startsWith("Dose 2 · day 7"));
+  assert.ok(splitDoseTimes.every((doseTime) => doseTime.querySelector("strong")?.textContent.trim()), "each dose day should show its own estimated time");
+
   const patientProfilePanel = input(dom, "setup");
   const doseSetupPanel = input(dom, "doseSetupPanel");
   const bodyWeight = input(dom, "bodyWeightKg");
@@ -263,7 +290,7 @@ async function run() {
   assert.equal(input(dom, "resultsTable").textContent.includes("Day 0: 32 min"), false);
   assert.equal(input(dom, "resultsTable").textContent.includes("Time by cartridge"), false);
   assert.equal(dom.window.document.querySelector("#compareBar"), null, "redundant top comparison bar should be removed");
-  const infusionTimeRow = Array.from(input(dom, "resultsTable").querySelectorAll("tbody tr")).find((row) => row.querySelector("td").textContent.trim() === "Estimated infusion time");
+  const infusionTimeRow = Array.from(input(dom, "resultsTable").querySelectorAll("tbody tr")).find((row) => row.querySelector("td").textContent.trim() === "Estimated infusion time per dose day");
   assert.ok(infusionTimeRow, "concise infusion-time row should be present");
   assert.equal(infusionTimeRow.querySelectorAll("td")[1].textContent.replace(/\s+/g, " ").trim(), "32 min (18+9+5 min)");
   assert.ok(infusionTimeRow.querySelectorAll("td")[1].querySelector(".infusion-time-cell"), "infusion time should include the minute breakdown in the same cell");
@@ -298,7 +325,7 @@ async function run() {
     .find((row) => row.querySelector("td").textContent.trim() === "Cartridge feasibility");
   assert.ok(doubleDoseFeasibilityRow.querySelectorAll("td")[2].querySelector(".metric-status-ok"), "a doubled comparator dose should auto-allocate its own available cartridge mix");
   const doubleDoseTimeRow = Array.from(input(doubleDoseDom, "resultsTable").querySelectorAll("tbody tr"))
-    .find((row) => row.querySelector("td").textContent.trim() === "Estimated infusion time");
+    .find((row) => row.querySelector("td").textContent.trim() === "Estimated infusion time per dose day");
   assert.ok(doubleDoseTimeRow.querySelectorAll("td")[2].textContent.includes("46+9 min"), "the doubled comparator should use a 50 mL and 10 mL cartridge allocation");
 
   const switchModeButton = dom.window.document.querySelector('[data-chart-mode="switch"]');
@@ -361,7 +388,7 @@ async function run() {
   assert.ok(Array.from(input(dom, "referencePreset").options).some((option) => option.textContent.includes("130 mL every 14 days")));
   assert.ok(Array.from(input(dom, "candidatePreset").options).some((option) => option.textContent.includes("130 mL every 9 days")));
   assert.ok(input(dom, "referenceRegimenHelp").textContent.includes("26 g / 130 mL"));
-  const highDoseInfusionTimeRow = Array.from(input(dom, "resultsTable").querySelectorAll("tbody tr")).find((row) => row.querySelector("td").textContent.trim() === "Estimated infusion time");
+  const highDoseInfusionTimeRow = Array.from(input(dom, "resultsTable").querySelectorAll("tbody tr")).find((row) => row.querySelector("td").textContent.trim() === "Estimated infusion time per dose day");
   assert.equal(input(dom, "resultsTable").textContent.includes("Time by cartridge"), false, "separate cartridge timing row should stay removed");
   assert.ok(highDoseInfusionTimeRow.querySelectorAll("td")[1].textContent.includes("+"), "high-dose infusion timing should show additive minute detail");
 

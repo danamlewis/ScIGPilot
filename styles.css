@@ -773,6 +773,31 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 
+.infusion-time-cell-multiple {
+  gap: 7px;
+  width: 100%;
+}
+
+.infusion-dose-time {
+  align-items: center;
+  display: inline-grid;
+  gap: 1px;
+  justify-items: center;
+}
+
+.infusion-dose-time + .infusion-dose-time {
+  border-top: 1px solid var(--line);
+  padding-top: 7px;
+}
+
+.infusion-time-cell .infusion-dose-label {
+  color: var(--accent-deep);
+  font-size: 0.66rem;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
 .infusion-time-warning {
   color: #a14d22 !important;
   font-weight: 800;
@@ -2600,6 +2625,14 @@ button:disabled {
 
   .print-results-table .infusion-time-cell {
     gap: 0;
+  }
+
+  .print-results-table .infusion-time-cell-multiple {
+    gap: 2px;
+  }
+
+  .print-results-table .infusion-dose-time + .infusion-dose-time {
+    padding-top: 2px;
   }
 
   .print-results-table .infusion-time-cell small {
